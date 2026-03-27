@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+
+members = [
+  "crates/gst-meet",
+  "crates/gst-recorder",
+]
+
+default-members = ["crates/gst-meet"]
+
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+
+[workspace.dependencies]
+libstrophe = "0.20.3"
+log = "0.4.29"
+env_logger = "0.11.9"
+gstreamer = "0.25.1"
+gstreamer-sdp = "0.25.0"
+gstreamer-webrtc = "0.25.0"
+webrtc-sdp = "0.3.13"
+chrono = "0.4.44"

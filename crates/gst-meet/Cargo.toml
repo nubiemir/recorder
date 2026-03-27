@@ -1,0 +1,15 @@
+[package]
+name = "gst-meet"
+version.workspace = true
+edition.workspace = true
+
+
+[dependencies]
+libstrophe.workspace = true 
+log.workspace = true
+env_logger.workspace = true
+gstreamer.workspace = true
+gstreamer-sdp.workspace = true
+gstreamer-webrtc.workspace = true
+webrtc-sdp.workspace = true
+chrono.workspace = true
