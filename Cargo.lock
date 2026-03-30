@@ -334,6 +334,7 @@ dependencies = [
  "gstreamer-webrtc",
  "libstrophe",
  "log",
+ "thiserror",
  "webrtc-sdp",
 ]
 

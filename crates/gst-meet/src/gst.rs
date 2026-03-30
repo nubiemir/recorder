@@ -9,16 +9,7 @@ use libstrophe::Stanza;
 use log::{error, info};
 use webrtc_sdp::parse_sdp;
 
-use crate::{
-    jingle::{JingleSession, sdp_jingle_session},
-    sdp::parse_sdp_jingle,
-};
-
-pub fn webrtcbin(
-    offer: &str,
-    session: Arc<JingleSession>,
-    tx: Sender<Stanza>,
-) -> Result<(), BoolError> {
+pub fn webrtcbin(offer: &str, tx: Sender<Stanza>) -> Result<(), BoolError> {
     let pipeline = Pipeline::new();
 
     let webrtc = ElementFactory::make("webrtcbin").build()?;
@@ -102,14 +93,15 @@ pub fn webrtcbin(
             match local_desc.sdp().as_text() {
                 Ok(sdp) => match parse_sdp(sdp.as_str(), true) {
                     Ok(sdp_sess) => {
-                        let jingle_sess = sdp_jingle_session(sdp_sess, Arc::clone(&session));
+                        info!("webrtcbin sdp session: {}", sdp_sess);
+                        // let jingle_sess = sdp_jingle_session(sdp_sess, Arc::clone(&session));
 
-                        let jingle_stanza = parse_sdp_jingle(
-                            session.from.as_str(),
-                            session.to.as_str(),
-                            &jingle_sess,
-                        );
-                        tx.send(jingle_stanza).expect("Failed to send stanza");
+                        // let jingle_stanza = parse_sdp_jingle(
+                        //     session.from.as_str(),
+                        //     session.to.as_str(),
+                        //     &jingle_sess,
+                        // );
+                        // tx.send(jingle_stanza).expect("Failed to send stanza");
                     }
                     Err(err) => {
                         error!("Error Parsing Sdp: {}", err)

@@ -1,25 +1,23 @@
 use std::{
+    ops::Deref,
     sync::{Arc, Mutex, mpsc::Sender},
     time::Duration,
 };
 
-use gst_meet::{gst::webrtcbin, jingle::parse_session_initiate, sdp::parse_jingle_sdp};
+use gst_meet::{gst::webrtcbin, jingle::from_jingle};
 use libstrophe::{Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult, Stanza};
 use log::{error, info, warn};
 
 fn presence_handler() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
-    move |_ctx: &Context, _conn: &mut Connection, _stanza: &Stanza| {
-        info!("presence stanza: {}", _stanza.to_string());
-        HandlerResult::KeepHandler
-    }
+    move |_ctx: &Context, _conn: &mut Connection, _stanza: &Stanza| HandlerResult::KeepHandler
 }
 
 fn iq_handler(
     tx: Sender<Stanza>,
 ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
     move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
-        let to = stanza.get_attribute("to").unwrap_or_default();
-        let from = stanza.get_attribute("from").unwrap_or_default();
+        // let to = stanza.get_attribute("to").unwrap_or_default();
+        // let from = stanza.get_attribute("from").unwrap_or_default();
         let _id = stanza.get_attribute("id").unwrap_or_default();
         let _iq_type = stanza.get_attribute("type").unwrap_or_default();
         let child = stanza.get_first_child().unwrap();
@@ -28,26 +26,27 @@ fn iq_handler(
                 if c == "jingle" {
                     let action = child.get_attribute("action").unwrap_or_default();
                     if action == "session-initiate" {
-                        info!("received session initiate");
-                        //     info!("got session initiate request");
-                        //     let session = parse_session_initiate(&child, to, from);
-                        //     info!("parsed session initiate request");
-                        //     if let Some(sess) = session {
-                        //         let sess = Arc::new(sess);
-                        //         let sdp = parse_jingle_sdp(Arc::clone(&sess));
-                        //         let res = webrtcbin(&sdp, Arc::clone(&sess), tx.clone());
-                        //         match res {
-                        //             Err(err) => warn!("Error occured: {:?}", err),
-                        //             _ => {}
-                        //         }
-                        //     }
+                        info!("got session initiate request");
+                        match from_jingle(child.deref()) {
+                            Ok(sdp) => {
+                                info!("created sdp");
+                                let res = webrtcbin(&sdp, tx.clone());
+                                match res {
+                                    Err(err) => warn!("Error occured: {:?}", err),
+                                    _ => {}
+                                }
+                            }
+                            Err(err) => {
+                                warn!("Failed to generate sdp: {}", err);
+                            }
+                        }
                     }
                 }
             }
 
             None => {}
         }
-        info!("iq stanza: {}", stanza.to_string());
+        // info!("iq stanza: {}", stanza.to_string());
         HandlerResult::KeepHandler
     }
 }

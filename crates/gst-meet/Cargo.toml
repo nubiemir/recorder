@@ -13,3 +13,4 @@ gstreamer-sdp.workspace = true
 gstreamer-webrtc.workspace = true
 webrtc-sdp.workspace = true
 chrono.workspace = true
+thiserror.workspace = true
