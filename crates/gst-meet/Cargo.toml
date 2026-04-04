@@ -14,3 +14,4 @@ gstreamer-webrtc.workspace = true
 webrtc-sdp.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
+nanoid.workspace = true

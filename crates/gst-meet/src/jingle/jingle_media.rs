@@ -1,6 +1,6 @@
 use libstrophe::Stanza;
 
-use crate::sdp_util::{exists, find_all, find_first};
+use crate::jingle::jingle_util::{exists, find_all, find_first};
 
 #[derive(Debug, Default)]
 pub struct JingleMedia {

@@ -1,8 +1,9 @@
 pub mod jingle_media;
+pub mod jingle_util;
 
 use std::ops::Deref;
 
-use crate::{jingle::jingle_media::JingleMedia, sdp_util::find_all};
+use crate::{jingle::jingle_media::JingleMedia, jingle::jingle_util::find_all};
 use chrono::Utc;
 use libstrophe::Stanza;
 use thiserror::Error;
@@ -16,12 +17,54 @@ use webrtc_sdp::{
     parse_sdp,
 };
 
+#[derive(Debug, Clone, Default)]
+pub struct Jingle {
+    sid: String,
+    initiator: String,
+    responder: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Iq {
+    pub from: String,
+    pub to: String,
+    pub id: String,
+}
+
 #[derive(Debug, Error)]
 pub enum JingleSdpParserError {
     #[error(transparent)]
     SdpParserInternalError(#[from] SdpParserInternalError),
     #[error(transparent)]
     SdpParserError(#[from] SdpParserError),
+}
+
+impl Iq {
+    pub fn new(id: String, to: String, from: String) -> Iq {
+        return Iq { id, to, from };
+    }
+}
+
+impl Jingle {
+    pub fn new(sid: String, initiator: String, responder: String) -> Jingle {
+        return Jingle {
+            sid,
+            initiator,
+            responder,
+        };
+    }
+
+    pub fn get_sid(&self) -> String {
+        self.sid.clone()
+    }
+
+    pub fn get_initiator(&self) -> String {
+        self.initiator.clone()
+    }
+
+    pub fn get_responder(&self) -> String {
+        self.responder.clone()
+    }
 }
 
 pub fn from_jingle(jingle: &Stanza) -> Result<String, JingleSdpParserError> {

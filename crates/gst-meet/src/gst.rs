@@ -1,15 +1,20 @@
 use std::sync::{Arc, mpsc::Sender};
 
+use crate::{
+    jingle::{Iq, Jingle},
+    sdp::to_jingle,
+};
 use gstreamer::{
     ElementFactory, Pad, Pipeline, Promise, State, Structure, glib::BoolError, prelude::*,
 };
 use gstreamer_sdp::SDPMessage;
 use gstreamer_webrtc::WebRTCSessionDescription;
 use libstrophe::Stanza;
-use log::{error, info};
+use log::{error, info, warn};
+use nanoid::nanoid;
 use webrtc_sdp::parse_sdp;
 
-pub fn webrtcbin(offer: &str, tx: Sender<Stanza>) -> Result<(), BoolError> {
+pub fn webrtcbin(offer: &str, jingle: Jingle, iq: Iq, tx: Sender<Stanza>) -> Result<(), BoolError> {
     let pipeline = Pipeline::new();
 
     let webrtc = ElementFactory::make("webrtcbin").build()?;
@@ -64,54 +69,41 @@ pub fn webrtcbin(offer: &str, tx: Sender<Stanza>) -> Result<(), BoolError> {
 
         webrtc_for_answer.emit_by_name::<()>("set-local-description", &[&answer, &None::<Promise>]);
 
-        // match answer.sdp().as_text() {
-        //     Ok(sdp) => match parse_sdp(sdp.as_str(), true) {
-        //         Ok(sdp_sess) => {
-        //             let jingle_sess = sdp_jingle_session(sdp_sess, Arc::clone(&session));
-        //
-        //             let jingle_stanza =
-        //                 parse_sdp_jingle(session.from.as_str(), session.to.as_str(), &jingle_sess);
-        //             tx.send(jingle_stanza).expect("Failed to send stanza");
-        //         }
-        //         Err(err) => {
-        //             error!("Error Parsing Sdp: {}", err)
-        //         }
-        //     },
-        //     Err(e) => error!("Failed to get SDP text: {e:?}"),
-        // }
+        match answer.sdp().as_text() {
+            Ok(sdp) => match parse_sdp(sdp.as_str(), true) {
+                Ok(sdp_sess) => {
+                    let jingle_stanza = to_jingle(&sdp_sess, jingle);
+
+                    match jingle_stanza {
+                        Ok(stanza) => {
+                            let id = nanoid!();
+                            info!("id: {}", id);
+                            let mut iq_stanza = Stanza::new_iq(Some("set"), Some(id.as_str()));
+                            iq_stanza.set_attribute("from", iq.to).unwrap();
+                            iq_stanza.set_attribute("to", iq.from).unwrap();
+                            iq_stanza.add_child(stanza).unwrap();
+                            tx.send(iq_stanza).expect("Failed to send stanza");
+                        }
+
+                        Err(err) => {
+                            warn!("jingle stanza error: {}", err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!("Error Parsing Sdp: {}", err)
+                }
+            },
+            Err(e) => error!("Failed to get SDP text: {e:?}"),
+        }
     });
 
     let webrtc_for_ice = Arc::clone(&webrtc_ref);
-    let webrtc_for_local = Arc::clone(&webrtc_ref);
+    let _webrtc_for_candidate = Arc::clone(&webrtc_ref);
 
     webrtc_for_ice.connect("on-ice-candidate", false, move |values| {
         let _mlineindex = values[1].get::<u32>().unwrap();
-        let candidate = values[2].get::<String>().unwrap();
-        if candidate.is_empty() {
-            let local_desc =
-                webrtc_for_local.property::<WebRTCSessionDescription>("local-description");
-            match local_desc.sdp().as_text() {
-                Ok(sdp) => match parse_sdp(sdp.as_str(), true) {
-                    Ok(sdp_sess) => {
-                        info!("webrtcbin sdp session: {}", sdp_sess);
-                        // let jingle_sess = sdp_jingle_session(sdp_sess, Arc::clone(&session));
-
-                        // let jingle_stanza = parse_sdp_jingle(
-                        //     session.from.as_str(),
-                        //     session.to.as_str(),
-                        //     &jingle_sess,
-                        // );
-                        // tx.send(jingle_stanza).expect("Failed to send stanza");
-                    }
-                    Err(err) => {
-                        error!("Error Parsing Sdp: {}", err)
-                    }
-                },
-                Err(e) => error!("Failed to get SDP text: {e:?}"),
-            }
-            return None;
-        }
-
+        let _candidate = values[2].get::<String>().unwrap();
         None
     });
 

@@ -4,7 +4,11 @@ use std::{
     time::Duration,
 };
 
-use gst_meet::{gst::webrtcbin, jingle::from_jingle};
+use gst_meet::{
+    gst::webrtcbin,
+    jingle::{Iq, Jingle, from_jingle},
+    xmpp::ack_session_initiate,
+};
 use libstrophe::{Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult, Stanza};
 use log::{error, info, warn};
 
@@ -16,35 +20,52 @@ fn iq_handler(
     tx: Sender<Stanza>,
 ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
     move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
-        // let to = stanza.get_attribute("to").unwrap_or_default();
-        // let from = stanza.get_attribute("from").unwrap_or_default();
-        let _id = stanza.get_attribute("id").unwrap_or_default();
-        let _iq_type = stanza.get_attribute("type").unwrap_or_default();
-        let child = stanza.get_first_child().unwrap();
-        match child.name() {
-            Some(c) => {
-                if c == "jingle" {
-                    let action = child.get_attribute("action").unwrap_or_default();
-                    if action == "session-initiate" {
-                        info!("got session initiate request");
-                        match from_jingle(child.deref()) {
-                            Ok(sdp) => {
-                                info!("created sdp");
-                                let res = webrtcbin(&sdp, tx.clone());
-                                match res {
-                                    Err(err) => warn!("Error occured: {:?}", err),
-                                    _ => {}
+        let to = stanza.get_attribute("to").unwrap_or_default();
+        let from = stanza.get_attribute("from").unwrap_or_default();
+        let id = stanza.get_attribute("id").unwrap_or_default();
+        let iq_type = stanza.get_attribute("type").unwrap_or_default();
+        let child = stanza.get_first_child();
+
+        if iq_type == "set" {
+            if let Ok(stanza) = ack_session_initiate(stanza) {
+                tx.send(stanza).expect("failed to send ack session");
+            }
+        }
+        if let Some(child) = child {
+            match child.name() {
+                Some(c) => {
+                    if c == "jingle" {
+                        let action = child.get_attribute("action").unwrap_or_default();
+                        if action == "session-initiate" {
+                            info!("got session initiate request");
+                            match from_jingle(child.deref()) {
+                                Ok(sdp) => {
+                                    let sid = child.get_attribute("sid");
+                                    let initiator = child.get_attribute("initiator");
+
+                                    let jingle = Jingle::new(
+                                        sid.unwrap_or_default().to_string(),
+                                        initiator.unwrap_or_default().to_string(),
+                                        to.to_string(),
+                                    );
+                                    let iq =
+                                        Iq::new(id.to_string(), to.to_string(), from.to_string());
+                                    let res = webrtcbin(&sdp, jingle, iq, tx.clone());
+                                    match res {
+                                        Err(err) => warn!("Error occured: {:?}", err),
+                                        _ => {}
+                                    }
                                 }
-                            }
-                            Err(err) => {
-                                warn!("Failed to generate sdp: {}", err);
+                                Err(err) => {
+                                    warn!("Failed to generate sdp: {}", err);
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            None => {}
+                None => {}
+            }
         }
         // info!("iq stanza: {}", stanza.to_string());
         HandlerResult::KeepHandler
@@ -124,7 +145,7 @@ fn main() {
         error!("Failed to disabled tls: {:?}", err);
     }
 
-    let ctx = conn.connect_client(Some("127.0.0.1"), Some(5222), connection_handler);
+    let ctx = conn.connect_client(Some("192.168.1.126"), Some(5222), connection_handler);
     match ctx {
         Ok(mut ctx) => {
             ctx.run();
