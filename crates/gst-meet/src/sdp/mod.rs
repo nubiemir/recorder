@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use libstrophe::{Error, Stanza};
 use webrtc_sdp::{
     SdpSession,
@@ -16,7 +18,7 @@ use crate::{
 
 pub mod sdp_util;
 
-pub fn to_jingle(sdp_session: &SdpSession, jingle: Jingle) -> Result<Stanza, Error> {
+pub fn to_jingle(sdp_session: &SdpSession, jingle: Arc<Jingle>) -> Result<Stanza, Error> {
     let mut jingle_stanza = Stanza::new();
     jingle_stanza.set_name("jingle")?;
     jingle_stanza.set_attribute("action", "session-accept")?;
@@ -35,6 +37,13 @@ pub fn to_jingle(sdp_session: &SdpSession, jingle: Jingle) -> Result<Stanza, Err
             group_stanza.set_ns(XEP::BundleMedia.to_string())?;
         }
 
+        for content in ["audio", "video"] {
+            let mut content_stanza = Stanza::new();
+            content_stanza.set_name("content")?;
+            content_stanza.set_attribute("name", content.to_string())?;
+            group_stanza.add_child(content_stanza)?;
+        }
+
         jingle_stanza.add_child(group_stanza)?;
     }
 
@@ -44,8 +53,8 @@ pub fn to_jingle(sdp_session: &SdpSession, jingle: Jingle) -> Result<Stanza, Err
         let mut content_stanza = Stanza::new();
         content_stanza.set_name("content")?;
         content_stanza.set_attribute("name", media_type.to_string())?;
-        content_stanza.set_attribute("creator", "responder")?;
-        content_stanza.set_attribute("senders", "responder")?;
+        content_stanza.set_attribute("creator", "initiator")?;
+        content_stanza.set_attribute("senders", "initiator")?;
 
         if ["audio", "video"].contains(&media_type.as_str()) {
             let mut description_stanza = Stanza::new();

@@ -1,16 +1,11 @@
 use std::{
-    ops::Deref,
     sync::{Arc, Mutex, mpsc::Sender},
     time::Duration,
 };
 
-use gst_meet::{
-    gst::webrtcbin,
-    jingle::{Iq, Jingle, from_jingle},
-    xmpp::ack_session_initiate,
-};
+use gst_meet::xmpp::{ack_session_initiate, handle_jingle_request, handle_query_request};
 use libstrophe::{Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult, Stanza};
-use log::{error, info, warn};
+use log::{error, info};
 
 fn presence_handler() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
     move |_ctx: &Context, _conn: &mut Connection, _stanza: &Stanza| HandlerResult::KeepHandler
@@ -26,48 +21,21 @@ fn iq_handler(
         let iq_type = stanza.get_attribute("type").unwrap_or_default();
         let child = stanza.get_first_child();
 
-        if iq_type == "set" {
-            if let Ok(stanza) = ack_session_initiate(stanza) {
-                tx.send(stanza).expect("failed to send ack session");
-            }
-        }
+        info!("iq_messages: {}", stanza);
+
         if let Some(child) = child {
             match child.name() {
-                Some(c) => {
-                    if c == "jingle" {
-                        let action = child.get_attribute("action").unwrap_or_default();
-                        if action == "session-initiate" {
-                            info!("got session initiate request");
-                            match from_jingle(child.deref()) {
-                                Ok(sdp) => {
-                                    let sid = child.get_attribute("sid");
-                                    let initiator = child.get_attribute("initiator");
+                Some("jingle") => handle_jingle_request(&child, tx.clone(), &id, &to, &from),
+                Some("query") => handle_query_request(&child, tx.clone(), &id, &to, &from),
+                _ => {}
+            }
 
-                                    let jingle = Jingle::new(
-                                        sid.unwrap_or_default().to_string(),
-                                        initiator.unwrap_or_default().to_string(),
-                                        to.to_string(),
-                                    );
-                                    let iq =
-                                        Iq::new(id.to_string(), to.to_string(), from.to_string());
-                                    let res = webrtcbin(&sdp, jingle, iq, tx.clone());
-                                    match res {
-                                        Err(err) => warn!("Error occured: {:?}", err),
-                                        _ => {}
-                                    }
-                                }
-                                Err(err) => {
-                                    warn!("Failed to generate sdp: {}", err);
-                                }
-                            }
-                        }
-                    }
+            if iq_type == "set" {
+                if let Ok(stanza) = ack_session_initiate(stanza) {
+                    tx.send(stanza).expect("failed to send ack session");
                 }
-
-                None => {}
             }
         }
-        // info!("iq stanza: {}", stanza.to_string());
         HandlerResult::KeepHandler
     }
 }
@@ -110,7 +78,7 @@ fn main() {
                 conn.timed_handler_add(
                     move |_ctx, conn| {
                         while let Ok(stanza) = rx_clone.lock().unwrap().try_recv() {
-                            info!("Sending stanza");
+                            info!("Sending Stanza: {}", stanza.to_string());
                             conn.send(&stanza);
                         }
                         HandlerResult::KeepHandler

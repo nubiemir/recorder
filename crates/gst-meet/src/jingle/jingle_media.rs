@@ -54,13 +54,11 @@ impl JingleMedia {
 
     fn set_senders(&self, content: &Stanza, sdp: &mut String) {
         let senders = content.get_attribute("senders").unwrap_or_default();
-
         match senders {
-            "initiator" => sdp.push_str("a=sendonly\r\n"),
-            "responder" => sdp.push_str("a=recvonly\r\n"),
+            "initiator" => sdp.push_str("a=recvonly\r\n"),
+            "responder" => sdp.push_str("a=sendonly\r\n"),
             "none" => sdp.push_str("a=inactive\r\n"),
             "both" => sdp.push_str("a=sendrecv\r\n"),
-
             _ => {}
         }
     }

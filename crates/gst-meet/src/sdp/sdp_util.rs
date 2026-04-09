@@ -208,6 +208,52 @@ fn fingerprint_to_hex(fp: &[u8]) -> String {
     hx
 }
 
+pub fn parse_candidate(
+    candidate_stanza: &mut Stanza,
+    candidate: &SdpAttributeCandidate,
+) -> Result<(), Error> {
+    candidate_stanza.set_name("candidate")?;
+    candidate_stanza.set_attribute("port", candidate.port.to_string())?;
+    candidate_stanza.set_attribute("component", candidate.component.to_string())?;
+    candidate_stanza.set_attribute("foundation", candidate.foundation.to_string())?;
+    candidate_stanza.set_attribute("type", candidate.c_type.to_string())?;
+    match candidate.address.clone() {
+        Address::Ip(ip) => {
+            candidate_stanza.set_attribute("ip", ip.to_string())?;
+        }
+        Address::Fqdn(fqdn) => {
+            candidate_stanza.set_attribute("ip", fqdn)?;
+        }
+    }
+    candidate_stanza.set_attribute("priority", candidate.priority.to_string())?;
+
+    if let Some(raddr) = candidate.raddr.clone() {
+        match raddr {
+            Address::Ip(ip) => {
+                candidate_stanza.set_attribute("rel-addr", ip.to_string())?;
+            }
+
+            Address::Fqdn(fqdn) => {
+                candidate_stanza.set_attribute("rel-addr", fqdn)?;
+            }
+        }
+    }
+
+    if let Some(rport) = candidate.rport {
+        candidate_stanza.set_attribute("rel-port", rport.to_string())?;
+    }
+
+    candidate_stanza.set_attribute(
+        "generation",
+        candidate.generation.unwrap_or_default().to_string(),
+    )?;
+
+    candidate_stanza.set_attribute("network", "1")?;
+    candidate_stanza.set_attribute("id", nanoid!())?;
+    candidate_stanza.set_attribute("protocol", candidate.transport.to_string().to_lowercase())?;
+    Ok(())
+}
+
 pub fn transport_to_jingle(media: &SdpMedia, stanza: &mut Stanza) -> Result<(), Error> {
     let fingerprints: Vec<SdpAttributeFingerprint> = media
         .get_attributes_of_type(SdpAttributeType::Fingerprint)
@@ -265,44 +311,9 @@ pub fn transport_to_jingle(media: &SdpMedia, stanza: &mut Stanza) -> Result<(), 
 
         for candidate in ice_candidates {
             let mut candidate_stanza = Stanza::new();
-            candidate_stanza.set_name("candidate")?;
-            candidate_stanza.set_attribute("port", candidate.port.to_string())?;
-            candidate_stanza.set_attribute("component", candidate.component.to_string())?;
-            match candidate.address {
-                Address::Ip(ip) => {
-                    candidate_stanza.set_attribute("ip", ip.to_string())?;
-                }
-                Address::Fqdn(fqdn) => {
-                    candidate_stanza.set_attribute("ip", fqdn)?;
-                }
+            if let Ok(()) = parse_candidate(&mut candidate_stanza, &candidate) {
+                stanza.add_child(candidate_stanza)?;
             }
-            candidate_stanza.set_attribute("priority", candidate.priority.to_string())?;
-
-            if let Some(raddr) = candidate.raddr {
-                match raddr {
-                    Address::Ip(ip) => {
-                        candidate_stanza.set_attribute("rel-addr", ip.to_string())?;
-                    }
-
-                    Address::Fqdn(fqdn) => {
-                        candidate_stanza.set_attribute("rel-addr", fqdn)?;
-                    }
-                }
-            }
-
-            if let Some(rport) = candidate.rport {
-                candidate_stanza.set_attribute("rel-port", rport.to_string())?;
-            }
-
-            candidate_stanza.set_attribute(
-                "generation",
-                candidate.generation.unwrap_or_default().to_string(),
-            )?;
-
-            candidate_stanza.set_attribute("network", "1")?;
-            candidate_stanza.set_attribute("id", nanoid!())?;
-
-            stanza.add_child(candidate_stanza)?;
         }
     }
 
