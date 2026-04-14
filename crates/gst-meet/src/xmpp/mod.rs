@@ -29,33 +29,40 @@ pub fn handle_jingle_request(
     iq_from: &str,
 ) {
     let action = child.get_attribute("action").unwrap_or_default();
-    if action == "session-initiate" {
-        info!("got session initiate request");
-        match from_jingle(child) {
-            Ok(sdp) => {
-                let sid = child.get_attribute("sid");
-                let initiator = child.get_attribute("initiator");
+    match action {
+        "session-initiate" => {
+            info!("got session initiate request");
+            match from_jingle(child) {
+                Ok(sdp) => {
+                    let sid = child.get_attribute("sid");
+                    let initiator = child.get_attribute("initiator");
 
-                let jingle = Arc::new(Jingle::new(
-                    sid.unwrap_or_default().to_string(),
-                    initiator.unwrap_or_default().to_string(),
-                    iq_to.to_string(),
-                ));
-                let iq = Arc::new(Iq::new(
-                    iq_id.to_string(),
-                    iq_to.to_string(),
-                    iq_from.to_string(),
-                ));
-                let res = webrtcbin(&sdp, jingle, iq, tx.clone());
-                match res {
-                    Err(err) => warn!("Error occured: {:?}", err),
-                    _ => {}
+                    let jingle = Arc::new(Jingle::new(
+                        sid.unwrap_or_default().to_string(),
+                        initiator.unwrap_or_default().to_string(),
+                        iq_to.to_string(),
+                    ));
+                    let iq = Arc::new(Iq::new(
+                        iq_id.to_string(),
+                        iq_to.to_string(),
+                        iq_from.to_string(),
+                    ));
+                    let res = webrtcbin(&sdp, jingle, iq, tx.clone());
+                    match res {
+                        Err(err) => warn!("Error occured: {:?}", err),
+                        _ => {}
+                    }
+                }
+                Err(err) => {
+                    warn!("Failed to generate sdp: {}", err);
                 }
             }
-            Err(err) => {
-                warn!("Failed to generate sdp: {}", err);
-            }
         }
+        "source-add" => {
+            info!("source-added: {}", child.to_string());
+        }
+
+        _ => {}
     }
 }
 

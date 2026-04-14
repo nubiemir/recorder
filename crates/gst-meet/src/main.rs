@@ -5,7 +5,7 @@ use std::{
 
 use gst_meet::xmpp::{ack_session_initiate, handle_jingle_request, handle_query_request};
 use libstrophe::{Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult, Stanza};
-use log::{error, info};
+use log::{debug, error, info};
 
 fn presence_handler() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
     move |_ctx: &Context, _conn: &mut Connection, _stanza: &Stanza| HandlerResult::KeepHandler
@@ -21,7 +21,7 @@ fn iq_handler(
         let iq_type = stanza.get_attribute("type").unwrap_or_default();
         let child = stanza.get_first_child();
 
-        info!("iq_messages: {}", stanza);
+        debug!("iq_messages: {}", stanza);
 
         if let Some(child) = child {
             match child.name() {
@@ -78,7 +78,7 @@ fn main() {
                 conn.timed_handler_add(
                     move |_ctx, conn| {
                         while let Ok(stanza) = rx_clone.lock().unwrap().try_recv() {
-                            info!("Sending Stanza: {}", stanza.to_string());
+                            debug!("Sending Stanza: {}", stanza.to_string());
                             conn.send(&stanza);
                         }
                         HandlerResult::KeepHandler
