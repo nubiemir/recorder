@@ -1,0 +1,13 @@
+name="jitsi recorder"
+debug=false
+
+[server]
+ip = "0.0.0.0"
+port = "3210"
+start_pattern_trim = "/?room="
+
+[xmpp]
+bot_jid = "bot@hidden.meet.jitsi"
+bot_password = "botpassword"
+domain_url = "192.168.1.130"
+domain_port = 5222
