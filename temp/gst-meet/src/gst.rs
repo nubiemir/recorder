@@ -929,4 +929,3 @@ pub fn webrtcbin(
     info!("Pipeline started");
     Ok(())
 }
-

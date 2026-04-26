@@ -113,7 +113,7 @@ fn main() {
         error!("Failed to disabled tls: {:?}", err);
     }
 
-    let ctx = conn.connect_client(Some("192.168.1.126"), Some(5222), connection_handler);
+    let ctx = conn.connect_client(Some("192.168.1.130"), Some(5222), connection_handler);
     match ctx {
         Ok(mut ctx) => {
             ctx.run();
