@@ -1,17 +1,14 @@
 use config::{Config, ConfigError};
 use env_logger::Builder;
-use gst_meet::app::App;
-use libstrophe::Connection;
+use gst_meet::xmpp::App;
 use log::{error, info};
 use serde::Deserialize;
-use std::{env, fmt::Display};
-use tiny_http::Server;
+use std::{env, fmt::Display, sync::Arc, thread};
+use tiny_http::{Request, Server};
 
 fn main() {
-    let config = Settings::new().unwrap();
+    let config = Arc::new(Settings::new().unwrap());
     config.logger_init();
-
-    let xmpp_connection = init_xmpp_connection(&config);
 
     let ip = &config.server.ip;
     let port = &config.server.port;
@@ -19,25 +16,38 @@ fn main() {
     match server {
         Ok(server) => {
             info!("started listening on: {:?}", server.server_addr());
-            let app = App::new(xmpp_connection);
-            for request in server.incoming_requests() {
-                let room = request
-                    .url()
-                    .trim_start_matches(config.server.start_pattern_trim.as_str());
+            let app = App::xmpp_connect(
+                &config.xmpp_client.domain_url,
+                config.xmpp_client.domain_port,
+                &config.xmpp_client.bot_jid,
+                &config.xmpp_client.bot_password,
+            );
+
+            match app {
+                Ok(mut app) => {
+                    app.xmpp_context.run();
+                    for request in server.incoming_requests() {
+                        let config = Arc::clone(&config);
+                        thread::spawn(move || {
+                            handle_request(request, config);
+                        });
+                    }
+                }
+                Err(err) => {
+                    error!("failed connecting to xmpp: {:?}", err);
+                }
             }
         }
         Err(err) => {
-            error!("Error starting server: {:?}", err);
+            error!("error starting server: {:?}", err);
         }
     }
 }
 
-fn init_xmpp_connection(settings: &Settings) -> Connection<'static, 'static> {
-    let ctx = libstrophe::Context::new_with_default_logger();
-    let mut conn = libstrophe::Connection::new(ctx);
-    conn.set_jid(&settings.xmpp_clinet.bot_jid);
-    conn.set_pass(&settings.xmpp_clinet.bot_password);
-    return conn;
+fn handle_request(request: Request, config: Arc<Settings>) {
+    let _room = request
+        .url()
+        .trim_start_matches(config.server.start_pattern_trim.as_str());
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,7 +56,7 @@ pub(crate) struct Settings {
     pub debug: bool,
     pub name: String,
     pub server: ServerConfig,
-    pub xmpp_clinet: XmppClient,
+    pub xmpp_client: XmppClient,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,7 +73,7 @@ pub(crate) struct XmppClient {
     bot_jid: String,
     bot_password: String,
     domain_url: String,
-    domain_port: String,
+    domain_port: u16,
 }
 
 #[derive(Debug)]

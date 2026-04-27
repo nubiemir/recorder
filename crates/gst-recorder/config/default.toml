@@ -6,7 +6,7 @@ ip = "0.0.0.0"
 port = "3210"
 start_pattern_trim = "/?room="
 
-[xmpp]
+[xmpp_client]
 bot_jid = "bot@hidden.meet.jitsi"
 bot_password = "botpassword"
 domain_url = "192.168.1.130"
