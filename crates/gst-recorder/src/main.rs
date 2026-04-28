@@ -1,17 +1,25 @@
 use config::{Config, ConfigError};
 use env_logger::Builder;
-use gst_meet::app::App;
-use libstrophe::Connection;
-use log::{error, info};
+use gst_meet::{make_stanza, xmpp::App};
+use libstrophe::Stanza;
+use log::{debug, error, info};
 use serde::Deserialize;
-use std::{env, fmt::Display};
-use tiny_http::Server;
+use std::{
+    env,
+    fmt::Display,
+    process::exit,
+    sync::{
+        Arc,
+        mpsc::{SendError, Sender, channel},
+    },
+    thread,
+};
+use thiserror::Error;
+use tiny_http::{Request, Server};
 
 fn main() {
-    let config = Settings::new().unwrap();
+    let config = Arc::new(Settings::new().unwrap());
     config.logger_init();
-
-    let xmpp_connection = init_xmpp_connection(&config);
 
     let ip = &config.server.ip;
     let port = &config.server.port;
@@ -19,25 +27,101 @@ fn main() {
     match server {
         Ok(server) => {
             info!("started listening on: {:?}", server.server_addr());
-            let app = App::new(xmpp_connection);
-            for request in server.incoming_requests() {
-                let room = request
-                    .url()
-                    .trim_start_matches(config.server.start_pattern_trim.as_str());
+            let (tx, rx) = channel::<Stanza>();
+
+            let app = App::xmpp_connect(
+                &config.xmpp_client.domain_url,
+                config.xmpp_client.domain_port,
+                &config.xmpp_client.bot_jid,
+                &config.xmpp_client.bot_password,
+                rx,
+            );
+
+            match app {
+                Ok(mut app) => {
+                    let xmpp_handle = thread::spawn(move || {
+                        app.xmpp_run();
+                    });
+
+                    let tx = Arc::new(tx);
+                    for request in server.incoming_requests() {
+                        let config = Arc::clone(&config);
+                        let tx = tx.clone();
+                        thread::spawn(move || match handle_request(request, config, tx) {
+                            Ok(room) => {
+                                info!("sent presence for: {room} room");
+                            }
+                            Err(err) => {
+                                error!("failed to send presence for: {err:?} room");
+                            }
+                        });
+                    }
+
+                    if let Err(err) = xmpp_handle.join() {
+                        error!("{err:?}");
+                        exit(1);
+                    }
+                }
+                Err(err) => {
+                    error!("failed connecting to xmpp: {:?}", err);
+                }
             }
         }
         Err(err) => {
-            error!("Error starting server: {:?}", err);
+            error!("error starting server: {:?}", err);
         }
     }
 }
 
-fn init_xmpp_connection(settings: &Settings) -> Connection<'static, 'static> {
-    let ctx = libstrophe::Context::new_with_default_logger();
-    let mut conn = libstrophe::Connection::new(ctx);
-    conn.set_jid(&settings.xmpp_clinet.bot_jid);
-    conn.set_pass(&settings.xmpp_clinet.bot_password);
-    return conn;
+#[derive(Error, Debug)]
+enum RequestError {
+    #[error("failed to parse stanza for room '{room}': {source}")]
+    ParseError {
+        room: String,
+        #[source]
+        source: libstrophe::Error,
+    },
+    #[error("failed to send stanza for room '{room}': {source:?}")]
+    SendError {
+        room: String,
+        #[source]
+        source: SendError<Stanza>,
+    },
+}
+
+fn handle_request(
+    request: Request,
+    config: Arc<Settings>,
+    tx: Arc<Sender<Stanza>>,
+) -> Result<String, RequestError> {
+    let room = request
+        .url()
+        .trim_start_matches(config.server.start_pattern_trim.as_str());
+
+    debug!("room: {room}");
+
+    let x = make_stanza!("x", {
+    "xmlns" => "http://jabber.org/protocol/muc"
+}, [])
+    .map_err(|e| RequestError::ParseError {
+        room: room.to_string(),
+        source: e,
+    })?;
+
+    let presence = make_stanza!("presence", {
+    "to" => format!("{}@muc.meet.jitsi/xxxx", room)
+}, [x])
+    .map_err(|e| RequestError::ParseError {
+        room: room.to_string(),
+        source: e,
+    })?;
+
+    tx.send(presence).map_err(|e| RequestError::SendError {
+        room: room.to_string(),
+        source: e,
+    })?;
+
+    Ok(room.to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,7 +130,7 @@ pub(crate) struct Settings {
     pub debug: bool,
     pub name: String,
     pub server: ServerConfig,
-    pub xmpp_clinet: XmppClient,
+    pub xmpp_client: XmppClient,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,7 +147,7 @@ pub(crate) struct XmppClient {
     bot_jid: String,
     bot_password: String,
     domain_url: String,
-    domain_port: String,
+    domain_port: u16,
 }
 
 #[derive(Debug)]
