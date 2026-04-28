@@ -1,5 +1,13 @@
-use libstrophe::{ConnectClientError, Connection, ConnectionEvent, ConnectionFlags, Context};
-use log::{error, info};
+use std::{
+    sync::{Arc, Mutex, mpsc::Receiver},
+    time::Duration,
+};
+
+use libstrophe::{
+    ConnectClientError, Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult,
+    Stanza,
+};
+use log::{debug, error, info};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -15,28 +23,15 @@ pub enum AppError {
 }
 
 pub struct App {
-    pub xmpp_context: Context<'static, 'static>,
+    xmpp_context: Context<'static, 'static>,
+    pub xmpp_connection: Option<Connection<'static, 'static>>,
 }
 
 impl App {
     fn new(context: Context<'static, 'static>) -> Self {
         App {
             xmpp_context: context,
-        }
-    }
-
-    pub fn xmpp_connect(
-        host: &str,
-        port: u16,
-        jid: &str,
-        password: &str,
-    ) -> Result<Self, AppError> {
-        let conn = Self::init_xmpp_connection(jid, password)?;
-        let ctx = conn.connect_client(Some(host), Some(port), Self::xmpp_connection_handler());
-
-        match ctx {
-            Ok(ctx) => Ok(Self::new(ctx)),
-            Err(err) => Err(AppError::ConnectClientError(err)),
+            xmpp_connection: None,
         }
     }
 
@@ -55,13 +50,30 @@ impl App {
         return Ok(conn);
     }
 
-    fn xmpp_connection_handler()
-    -> impl FnMut(&libstrophe::Context<'_, '_>, &mut Connection<'_, '_>, ConnectionEvent<'_, '_>)
+    fn xmpp_connection_handler(
+        rx: Receiver<Stanza>,
+    ) -> impl FnMut(&libstrophe::Context<'_, '_>, &mut Connection<'_, '_>, ConnectionEvent<'_, '_>)
     + Send
     + 'static {
-        move |ctx, _conn, evt| match evt {
+        let rx_shared = Arc::new(Mutex::new(rx));
+        move |ctx, conn, evt| match evt {
             ConnectionEvent::Connect => {
                 info!("XMPP connected");
+
+                let rx_clone = Arc::clone(&rx_shared);
+                conn.timed_handler_add(
+                    move |_ctx, conn| {
+                        while let Ok(stanza) = rx_clone.lock().unwrap().try_recv() {
+                            debug!("Sending Stanza: {}", stanza.to_string());
+                            conn.send(&stanza);
+                        }
+                        HandlerResult::KeepHandler
+                    },
+                    Duration::from_millis(0),
+                );
+
+                conn.handler_add(Self::handle_message(), None, Some("presence"), None);
+                // conn.handler_add(Self::handle_iq(), None, Some("iq"), None);
             }
 
             ConnectionEvent::Disconnect(conn_error) => {
@@ -76,5 +88,39 @@ impl App {
 
             _ => {}
         }
+    }
+
+    fn _handle_iq() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
+        move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
+            info!("iq stanza received: {}", stanza.to_string());
+            HandlerResult::KeepHandler
+        }
+    }
+
+    fn handle_message() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
+        move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
+            info!("message stanza received: {}", stanza.to_string());
+            HandlerResult::KeepHandler
+        }
+    }
+
+    pub fn xmpp_connect(
+        host: &str,
+        port: u16,
+        jid: &str,
+        password: &str,
+        rx: Receiver<Stanza>,
+    ) -> Result<Self, AppError> {
+        let conn = Self::init_xmpp_connection(jid, password)?;
+        let ctx = conn.connect_client(Some(host), Some(port), Self::xmpp_connection_handler(rx));
+
+        match ctx {
+            Ok(ctx) => Ok(Self::new(ctx)),
+            Err(err) => Err(AppError::ConnectClientError(err)),
+        }
+    }
+
+    pub fn xmpp_run(&mut self) {
+        self.xmpp_context.run();
     }
 }
