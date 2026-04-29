@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex, mpsc::Receiver},
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, Sender},
+    },
     time::Duration,
 };
 
@@ -9,6 +12,8 @@ use libstrophe::{
 };
 use log::{debug, error, info};
 use thiserror::Error;
+
+use crate::iq::Iq;
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -22,16 +27,17 @@ pub enum AppError {
     Unkown,
 }
 
+#[allow(unused)]
 pub struct App {
     xmpp_context: Context<'static, 'static>,
-    pub xmpp_connection: Option<Connection<'static, 'static>>,
+    tx: Sender<Stanza>,
 }
 
 impl App {
-    fn new(context: Context<'static, 'static>) -> Self {
+    fn new(context: Context<'static, 'static>, tx: Sender<Stanza>) -> Self {
         App {
             xmpp_context: context,
-            xmpp_connection: None,
+            tx,
         }
     }
 
@@ -47,6 +53,7 @@ impl App {
         if let Err(err) = disable_tls {
             return Err(AppError::InitializationError(err));
         }
+
         return Ok(conn);
     }
 
@@ -73,7 +80,7 @@ impl App {
                 );
 
                 conn.handler_add(Self::handle_message(), None, Some("presence"), None);
-                // conn.handler_add(Self::handle_iq(), None, Some("iq"), None);
+                conn.handler_add(Self::handle_iq(), None, Some("iq"), None);
             }
 
             ConnectionEvent::Disconnect(conn_error) => {
@@ -90,9 +97,23 @@ impl App {
         }
     }
 
-    fn _handle_iq() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
+    fn handle_iq() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
-            info!("iq stanza received: {}", stanza.to_string());
+            debug!("iq stanza received: {}", stanza.to_string());
+            let mut iq = Iq::new(stanza);
+
+            if let Some(child) = stanza.get_first_child() {
+                match child.name() {
+                    Some("jingle") => {
+                        iq.handle_jingle(&child);
+                    }
+                    Some("query") => {
+                        iq.handle_query(&child);
+                    }
+                    _ => {}
+                }
+            }
+
             HandlerResult::KeepHandler
         }
     }
@@ -109,13 +130,14 @@ impl App {
         port: u16,
         jid: &str,
         password: &str,
+        tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
     ) -> Result<Self, AppError> {
         let conn = Self::init_xmpp_connection(jid, password)?;
         let ctx = conn.connect_client(Some(host), Some(port), Self::xmpp_connection_handler(rx));
 
         match ctx {
-            Ok(ctx) => Ok(Self::new(ctx)),
+            Ok(ctx) => Ok(Self::new(ctx, tx)),
             Err(err) => Err(AppError::ConnectClientError(err)),
         }
     }

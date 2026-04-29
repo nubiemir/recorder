@@ -34,6 +34,7 @@ fn main() {
                 config.xmpp_client.domain_port,
                 &config.xmpp_client.bot_jid,
                 &config.xmpp_client.bot_password,
+                tx.clone(),
                 rx,
             );
 
@@ -43,7 +44,6 @@ fn main() {
                         app.xmpp_run();
                     });
 
-                    let tx = Arc::new(tx);
                     for request in server.incoming_requests() {
                         let config = Arc::clone(&config);
                         let tx = tx.clone();
@@ -92,7 +92,7 @@ enum RequestError {
 fn handle_request(
     request: Request,
     config: Arc<Settings>,
-    tx: Arc<Sender<Stanza>>,
+    tx: Sender<Stanza>,
 ) -> Result<String, RequestError> {
     let room = request
         .url()
