@@ -13,6 +13,7 @@ use std::{
         mpsc::{SendError, Sender, channel},
     },
     thread,
+    time::Duration,
 };
 use thiserror::Error;
 use tiny_http::{Request, Server};
@@ -49,6 +50,7 @@ fn main() {
                         let tx = tx.clone();
                         thread::spawn(move || match handle_request(request, config, tx) {
                             Ok(room) => {
+                                thread::sleep(Duration::from_secs(10));
                                 info!("sent presence for: {room} room");
                             }
                             Err(err) => {

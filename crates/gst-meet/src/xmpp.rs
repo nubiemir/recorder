@@ -105,7 +105,7 @@ impl App {
             if let Some(child) = stanza.get_first_child() {
                 match child.name() {
                     Some("jingle") => {
-                        iq.handle_jingle(&child);
+                        iq.handle_jingle();
                     }
                     Some("query") => {
                         iq.handle_query(&child);
@@ -120,7 +120,7 @@ impl App {
 
     fn handle_message() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
-            info!("message stanza received: {}", stanza.to_string());
+            debug!("message stanza received: {}", stanza.to_string());
             HandlerResult::KeepHandler
         }
     }

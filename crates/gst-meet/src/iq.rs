@@ -1,78 +1,52 @@
-use crate::get_attributes;
+pub(crate) mod jingle_action;
+pub(crate) mod jingle_media;
+
+use crate::{
+    get_attribute,
+    iq::{jingle_action::JingleAction, jingle_media::JingleMedia},
+};
 use libstrophe::Stanza;
-use std::fmt::Display;
 
 #[derive(Debug)]
 #[allow(unused)]
-pub(crate) struct Iq {
+pub(crate) struct Iq<'a> {
     id: String,
     from: String,
     to: String,
     kind: String,
+    jingle_action: Option<JingleAction<'a>>,
+    jingle_media: JingleMedia,
 }
 
-#[derive(Debug)]
-enum JingleAction<'a> {
-    SessionInitiate(&'a Stanza),
-    SourceAdd(&'a Stanza),
-}
-
-impl Iq {
-    pub fn new(stanza: &Stanza) -> Self {
-        let iq_stanza = get_attributes!(stanza, {
+impl<'a> Iq<'a> {
+    pub fn new(stanza: &'a Stanza) -> Self {
+        let iq_stanza = get_attribute!(stanza, {
             from => "from",
             to => "to",
             id => "id",
             kind => "type"
         });
 
+        let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
+
+        let media = JingleMedia::new();
+        let jingle_action = JingleAction::parse(&jingle_stanza.action, stanza);
+
         Self {
             id: iq_stanza.id,
             from: iq_stanza.from,
             to: iq_stanza.to,
             kind: iq_stanza.kind,
+            jingle_action,
+            jingle_media: media,
         }
     }
 
-    pub fn handle_jingle(&mut self, stanza: &Stanza) {
-        let jingle_stanza = get_attributes!(stanza, [sid, initiator, action]);
-        if let Some(action) = JingleAction::parse(&jingle_stanza.action, stanza) {
-            action.handle();
+    pub fn handle_jingle(&mut self) {
+        if let Some(ref action) = self.jingle_action {
+            action.handle(&mut self.jingle_media);
         }
     }
 
     pub fn handle_query(&self, _stanza: &Stanza) {}
-}
-
-impl<'a> JingleAction<'a> {
-    fn parse(s: &str, stanza: &'a Stanza) -> Option<Self> {
-        match s {
-            "session-initiate" => Some(Self::SessionInitiate(stanza)),
-            "source-add" => Some(Self::SourceAdd(stanza)),
-            _ => None,
-        }
-    }
-
-    fn handle(&self) {
-        match self {
-            Self::SessionInitiate(stanza) => {
-                self.handle_session_initiate(stanza);
-            }
-            Self::SourceAdd(stanza) => {
-                self.handle_source_add(stanza);
-            }
-        }
-    }
-
-    fn handle_session_initiate(&self, _stanza: &Stanza) {}
-    fn handle_source_add(&self, _stanza: &Stanza) {}
-}
-
-impl<'a> Display for JingleAction<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SessionInitiate(_) => write!(f, "session-initiate"),
-            Self::SourceAdd(_) => write!(f, "source-add"),
-        }
-    }
 }

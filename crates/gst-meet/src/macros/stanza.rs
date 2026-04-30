@@ -38,7 +38,7 @@ macro_rules! make_stanza {
 }
 
 #[macro_export]
-macro_rules! get_attributes{
+macro_rules! get_attribute{
     ($stanza:expr, [$($field:ident),+]) => {{
         #[derive(Debug)]
         #[allow(unused)]
