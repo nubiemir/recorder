@@ -3,10 +3,7 @@ use std::fmt::Display;
 use chrono::Utc;
 use libstrophe::Stanza;
 
-use crate::{
-    iq::jingle_media::JingleMedia,
-    util::{find_all, find_first},
-};
+use crate::{iq::jingle_media::JingleMedia, util::find_all};
 
 #[derive(Debug)]
 pub enum JingleAction<'a> {
@@ -34,9 +31,12 @@ impl<'a> JingleAction<'a> {
         }
     }
 
-    fn handle_session_initiate(&self, stanza: &Stanza, media: &mut JingleMedia) {
-        let sdp_session = self.parse_sdp_session(stanza);
+    fn handle_session_initiate(&self, stanza: &Stanza, media: &mut JingleMedia) -> String {
+        let mut sdp_session = self.parse_sdp_session(stanza);
         let sdp_media = media.parse_sdp_media(stanza);
+        sdp_session.push_str(&sdp_media);
+
+        sdp_session
     }
     fn handle_source_add(&self, _stanza: &Stanza) {}
 
