@@ -42,11 +42,11 @@ impl<'a> Iq<'a> {
         }
     }
 
-    pub fn handle_jingle(&mut self) {
+    pub fn handle_jingle_to_sdp(&mut self) {
         if let Some(ref action) = self.jingle_action {
             action.handle(&mut self.jingle_media);
         }
     }
 
-    pub fn handle_query(&self, _stanza: &Stanza) {}
+    pub fn handle_query_to_query(&self, _stanza: &Stanza) {}
 }

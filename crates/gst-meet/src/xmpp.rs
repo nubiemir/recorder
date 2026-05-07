@@ -105,10 +105,10 @@ impl App {
             if let Some(child) = stanza.get_first_child() {
                 match child.name() {
                     Some("jingle") => {
-                        iq.handle_jingle();
+                        iq.handle_jingle_to_sdp();
                     }
                     Some("query") => {
-                        iq.handle_query(&child);
+                        iq.handle_query_to_query(&child);
                     }
                     _ => {}
                 }

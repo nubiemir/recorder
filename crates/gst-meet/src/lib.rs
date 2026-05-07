@@ -1,5 +1,6 @@
 pub mod iq;
 pub mod macros;
+pub mod sdp;
 pub mod util;
 pub mod xep;
 pub mod xmpp;

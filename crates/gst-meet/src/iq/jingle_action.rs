@@ -20,14 +20,10 @@ impl<'a> JingleAction<'a> {
         }
     }
 
-    pub(crate) fn handle(&self, media: &mut JingleMedia) {
+    pub(crate) fn handle(&self, media: &mut JingleMedia) -> String {
         match self {
-            Self::SessionInitiate(stanza) => {
-                self.handle_session_initiate(stanza, media);
-            }
-            Self::SourceAdd(stanza) => {
-                self.handle_source_add(stanza);
-            }
+            Self::SessionInitiate(stanza) => self.handle_session_initiate(stanza, media),
+            Self::SourceAdd(stanza) => self.handle_source_add(stanza),
         }
     }
 
@@ -38,7 +34,9 @@ impl<'a> JingleAction<'a> {
 
         sdp_session
     }
-    fn handle_source_add(&self, _stanza: &Stanza) {}
+    fn handle_source_add(&self, _stanza: &Stanza) -> String {
+        String::new()
+    }
 
     fn parse_sdp_session(&self, stanza: &Stanza) -> String {
         let mut sdp = String::new();
