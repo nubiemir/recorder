@@ -44,7 +44,15 @@ impl<'a> Iq<'a> {
 
     pub fn handle_jingle_to_sdp(&mut self) {
         if let Some(ref action) = self.jingle_action {
-            action.handle(&mut self.jingle_media);
+            match action {
+                JingleAction::SessionInitiate(stanza) => {
+                    let _jitsi_offer =
+                        action.handle_session_initiate(stanza, &mut self.jingle_media);
+                }
+                JingleAction::SourceAdd(stanza) => {
+                    action.handle_source_add(stanza);
+                }
+            }
         }
     }
 

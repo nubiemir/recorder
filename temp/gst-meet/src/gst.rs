@@ -757,6 +757,7 @@ pub fn webrtcbin(
                     debug!("sdp_answer: {}", sdp);
                     let jingle_stanza = to_jingle(&sdp_sess, jingle_ref.clone());
 
+
                     let mut ice_ufrag = String::new();
                     let mut ice_pwd = String::new();
                     for line in sdp.lines() {

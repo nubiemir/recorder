@@ -290,6 +290,7 @@ impl JingleMedia {
                     }
 
                     self.rtcp_fb_from_jingle(payload_type, sdp, id);
+
                 });
 
             self.rtcp_fb_from_jingle(&desc, sdp, "*");

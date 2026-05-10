@@ -20,21 +20,15 @@ impl<'a> JingleAction<'a> {
         }
     }
 
-    pub(crate) fn handle(&self, media: &mut JingleMedia) -> String {
-        match self {
-            Self::SessionInitiate(stanza) => self.handle_session_initiate(stanza, media),
-            Self::SourceAdd(stanza) => self.handle_source_add(stanza),
-        }
-    }
-
-    fn handle_session_initiate(&self, stanza: &Stanza, media: &mut JingleMedia) -> String {
+    pub fn handle_session_initiate(&self, stanza: &Stanza, media: &mut JingleMedia) -> String {
         let mut sdp_session = self.parse_sdp_session(stanza);
         let sdp_media = media.parse_sdp_media(stanza);
         sdp_session.push_str(&sdp_media);
 
         sdp_session
     }
-    fn handle_source_add(&self, _stanza: &Stanza) -> String {
+
+    pub fn handle_source_add(&self, _stanza: &Stanza) -> String {
         String::new()
     }
 

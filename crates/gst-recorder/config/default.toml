@@ -11,3 +11,7 @@ bot_jid = "bot@hidden.meet.jitsi"
 bot_password = "botpassword"
 domain_url = "192.168.1.130"
 domain_port = 5222
+
+[webrtc]
+stun_server = "stun://stun.l.google.com:19302"
+bundle_policy = "max-bundle"

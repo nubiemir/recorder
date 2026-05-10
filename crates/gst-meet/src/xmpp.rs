@@ -1,19 +1,19 @@
-use std::{
-    sync::{
-        Arc, Mutex,
-        mpsc::{Receiver, Sender},
-    },
-    time::Duration,
-};
-
 use libstrophe::{
     ConnectClientError, Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult,
     Stanza,
 };
 use log::{debug, error, info};
+use nanoid::nanoid;
+use std::{
+    sync::{
+        Arc, Mutex,
+        mpsc::{Receiver, SendError, Sender},
+    },
+    time::Duration,
+};
 use thiserror::Error;
 
-use crate::iq::Iq;
+use crate::{config::XmppClient, iq::Iq, make_stanza};
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -22,6 +22,19 @@ pub enum AppError {
 
     #[error("failed to connect: {0:?}")]
     ConnectClientError(ConnectClientError<'static, 'static>),
+
+    #[error("failed to parse stanza for room '{room}': {source}")]
+    ParseError {
+        room: String,
+        #[source]
+        source: libstrophe::Error,
+    },
+    #[error("failed to send stanza for room '{room}': {source:?}")]
+    SendError {
+        room: String,
+        #[source]
+        source: SendError<Stanza>,
+    },
 
     #[error("failed to connect: something went wrong")]
     Unkown,
@@ -126,15 +139,16 @@ impl App {
     }
 
     pub fn xmpp_connect(
-        host: &str,
-        port: u16,
-        jid: &str,
-        password: &str,
+        xmpp_clinet: &XmppClient,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
     ) -> Result<Self, AppError> {
-        let conn = Self::init_xmpp_connection(jid, password)?;
-        let ctx = conn.connect_client(Some(host), Some(port), Self::xmpp_connection_handler(rx));
+        let conn = Self::init_xmpp_connection(&xmpp_clinet.bot_jid, &xmpp_clinet.bot_password)?;
+        let ctx = conn.connect_client(
+            Some(&xmpp_clinet.domain_url),
+            Some(xmpp_clinet.domain_port),
+            Self::xmpp_connection_handler(rx),
+        );
 
         match ctx {
             Ok(ctx) => Ok(Self::new(ctx, tx)),
@@ -144,5 +158,32 @@ impl App {
 
     pub fn xmpp_run(&mut self) {
         self.xmpp_context.run();
+    }
+
+    pub fn handle_join_room(tx: &Sender<Stanza>, room: &str) -> Result<String, AppError> {
+        debug!("room: {room}");
+
+        let x = make_stanza!("x", {
+            "xmlns" => "http://jabber.org/protocol/muc"
+        }, [])
+        .map_err(|e| AppError::ParseError {
+            room: room.to_string(),
+            source: e,
+        })?;
+
+        let presence = make_stanza!("presence", {
+            "to" => format!("{}@muc.meet.jitsi/{}", room, nanoid!(10))
+        }, [x])
+        .map_err(|e| AppError::ParseError {
+            room: room.to_string(),
+            source: e,
+        })?;
+
+        tx.send(presence).map_err(|e| AppError::SendError {
+            room: room.to_string(),
+            source: e,
+        })?;
+
+        Ok(room.to_string())
     }
 }
