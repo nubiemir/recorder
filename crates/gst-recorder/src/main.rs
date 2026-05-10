@@ -29,17 +29,18 @@ fn main() {
             let tx_for_app = tx.clone();
 
             // Spawn XMPP thread — App is created and owned entirely here
-            let xmpp_handle =
-                thread::spawn(
-                    move || match App::xmpp_connect(&xmpp_config, tx_for_app, rx) {
-                        Ok(mut app) => app.xmpp_run(),
-                        Err(err) => error!("failed connecting to xmpp: {:?}", err),
-                    },
-                );
+            let room_manager_for_xmpp = room_manager.clone();
+            let xmpp_handle = thread::spawn(move || {
+                match App::xmpp_connect(&xmpp_config, room_manager_for_xmpp, tx_for_app, rx) {
+                    Ok(mut app) => app.xmpp_run(),
+                    Err(err) => error!("failed connecting to xmpp: {:?}", err),
+                }
+            });
 
             for request in server.incoming_requests() {
                 let config = Arc::clone(&config);
                 let tx = tx.clone();
+
                 let room_manager = room_manager.clone();
                 thread::spawn(move || {
                     let room = parse_room(request, &config);

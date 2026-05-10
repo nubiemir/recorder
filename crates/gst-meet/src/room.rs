@@ -2,8 +2,9 @@ use std::sync::mpsc::Sender;
 
 use gstreamer::{Element, ElementFactory, glib::BoolError, prelude::GObjectExtManualGst};
 use libstrophe::Stanza;
+use webrtc_sdp::SdpSession;
 
-use crate::config::Webrtc;
+use crate::{config::Webrtc, sdp::Sdp};
 
 #[derive(Debug)]
 pub struct Room {
@@ -40,5 +41,7 @@ impl Room {
         &self.webrtcbin
     }
 
-    pub fn handle_session_initiate(&self) {}
+    pub fn handle_session_initiate(&self, sdp_session: SdpSession) {
+        let sdp = Sdp::new(&sdp_session);
+    }
 }

@@ -13,7 +13,7 @@ use std::{
 };
 use thiserror::Error;
 
-use crate::{config::XmppClient, iq::Iq, make_stanza};
+use crate::{config::XmppClient, iq::Iq, make_stanza, room_manager::RoomManager};
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -72,6 +72,7 @@ impl App {
 
     fn xmpp_connection_handler(
         rx: Receiver<Stanza>,
+        room_manager: Arc<Mutex<RoomManager>>,
     ) -> impl FnMut(&libstrophe::Context<'_, '_>, &mut Connection<'_, '_>, ConnectionEvent<'_, '_>)
     + Send
     + 'static {
@@ -118,7 +119,7 @@ impl App {
             if let Some(child) = stanza.get_first_child() {
                 match child.name() {
                     Some("jingle") => {
-                        iq.handle_jingle_to_sdp();
+                        let offer_sdp = iq.handle_jingle_to_sdp();
                     }
                     Some("query") => {
                         iq.handle_query_to_query(&child);
@@ -140,6 +141,7 @@ impl App {
 
     pub fn xmpp_connect(
         xmpp_clinet: &XmppClient,
+        room_manager: Arc<Mutex<RoomManager>>,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
     ) -> Result<Self, AppError> {
@@ -147,7 +149,7 @@ impl App {
         let ctx = conn.connect_client(
             Some(&xmpp_clinet.domain_url),
             Some(xmpp_clinet.domain_port),
-            Self::xmpp_connection_handler(rx),
+            Self::xmpp_connection_handler(rx, room_manager),
         );
 
         match ctx {
