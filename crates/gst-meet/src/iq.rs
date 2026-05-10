@@ -4,16 +4,17 @@ pub(crate) mod jingle_media;
 use crate::{
     get_attribute,
     iq::{jingle_action::JingleAction, jingle_media::JingleMedia},
+    room::Room,
 };
 use libstrophe::Stanza;
 
 #[derive(Debug)]
 #[allow(unused)]
 pub(crate) struct Iq<'a> {
-    id: String,
-    from: String,
-    to: String,
-    kind: String,
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub kind: String,
     jingle_action: Option<JingleAction<'a>>,
     jingle_media: JingleMedia,
 }
@@ -42,11 +43,11 @@ impl<'a> Iq<'a> {
         }
     }
 
-    pub fn handle_jingle_to_sdp(&mut self) {
+    pub fn handle_jingle_to_sdp(&mut self, room: Option<&mut Room>) {
         if let Some(ref action) = self.jingle_action {
             match action {
                 JingleAction::SessionInitiate(stanza) => {
-                    let _jitsi_offer =
+                    let jitsi_offer =
                         action.handle_session_initiate(stanza, &mut self.jingle_media);
                 }
                 JingleAction::SourceAdd(stanza) => {

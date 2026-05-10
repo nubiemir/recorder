@@ -94,7 +94,12 @@ impl App {
                 );
 
                 conn.handler_add(Self::handle_message(), None, Some("presence"), None);
-                conn.handler_add(Self::handle_iq(), None, Some("iq"), None);
+                conn.handler_add(
+                    Self::handle_iq(room_manager.clone()),
+                    None,
+                    Some("iq"),
+                    None,
+                );
             }
 
             ConnectionEvent::Disconnect(conn_error) => {
@@ -111,16 +116,24 @@ impl App {
         }
     }
 
-    fn handle_iq() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
+    fn handle_iq(
+        room_manager: Arc<Mutex<RoomManager>>,
+    ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
             debug!("iq stanza received: {}", stanza.to_string());
             let mut iq = Iq::new(stanza);
 
             if let Some(child) = stanza.get_first_child() {
                 match child.name() {
-                    Some("jingle") => {
-                        let offer_sdp = iq.handle_jingle_to_sdp();
-                    }
+                    Some("jingle") => match room_manager.lock() {
+                        Ok(mut room_manager) => {
+                            let room_name = iq.from.split('@').next().unwrap_or_default();
+                            iq.handle_jingle_to_sdp(room_manager.get_mut(room_name));
+                        }
+                        Err(err) => {
+                            error!("failed to get mutext guard lock for jingle: {err:?}");
+                        }
+                    },
                     Some("query") => {
                         iq.handle_query_to_query(&child);
                     }

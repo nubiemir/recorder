@@ -4,7 +4,7 @@ use gstreamer::{Element, ElementFactory, glib::BoolError, prelude::GObjectExtMan
 use libstrophe::Stanza;
 use webrtc_sdp::SdpSession;
 
-use crate::{config::Webrtc, sdp::Sdp};
+use crate::{config::Webrtc, get_attribute, sdp::Sdp};
 
 #[derive(Debug)]
 pub struct Room {
@@ -41,7 +41,16 @@ impl Room {
         &self.webrtcbin
     }
 
-    pub fn handle_session_initiate(&self, sdp_session: SdpSession) {
+    pub fn handle_session_initiate(
+        &self,
+        responder: &str,
+        stanza: &Stanza,
+        sdp_session: SdpSession,
+    ) {
         let sdp = Sdp::new(&sdp_session);
+
+        let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
+        let answer =
+            sdp.parse_sdp_to_jingle(&jingle_stanza.initiator, &jingle_stanza.sid, responder);
     }
 }
