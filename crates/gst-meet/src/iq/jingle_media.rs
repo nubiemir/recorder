@@ -5,7 +5,7 @@ use crate::{
     util::{exists, find_all, find_first},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct JingleMedia {
     pub media: String,
     pub port: String,

@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use libstrophe::{Error, Stanza};
 use nanoid::nanoid;
 use webrtc_sdp::{
@@ -14,6 +16,14 @@ use webrtc_sdp::{
 use crate::{make_stanza, set_attribute, xep::XEP};
 
 pub struct Sdp<'a>(&'a SdpSession);
+
+impl<'a> Deref for Sdp<'a> {
+    type Target = SdpSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<'a> Sdp<'a> {
     pub fn new(sdp_session: &'a SdpSession) -> Self {
@@ -42,7 +52,7 @@ impl<'a> Sdp<'a> {
     }
 
     fn parse_group(&self, stanza: &mut Stanza) -> Result<(), Error> {
-        let sdp_group = self.0.get_attribute(SdpAttributeType::Group);
+        let sdp_group = self.get_attribute(SdpAttributeType::Group);
         if let Some(group) = sdp_group {
             if let SdpAttribute::Group(group_attr) = group {
                 let mut group_stanza = make_stanza!("group", {
@@ -63,7 +73,7 @@ impl<'a> Sdp<'a> {
     }
 
     fn parse_media(&self, jingle_stanza: &mut Stanza) -> Result<(), Error> {
-        for media in self.0.media.iter() {
+        for media in self.media.iter() {
             let media_type = media.get_type().to_string();
             let mut content_stanza = make_stanza!("content", {
                 "name" => media_type.to_string(),

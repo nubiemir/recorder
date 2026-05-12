@@ -25,13 +25,13 @@ fn main() {
             let room_manager = Arc::new(Mutex::new(RoomManager::new()));
 
             // Clone config values the XMPP thread needs
-            let xmpp_config = config.xmpp_client.clone();
+            let config_for_app = config.clone();
             let tx_for_app = tx.clone();
 
             // Spawn XMPP thread — App is created and owned entirely here
             let room_manager_for_xmpp = room_manager.clone();
             let xmpp_handle = thread::spawn(move || {
-                match App::xmpp_connect(&xmpp_config, room_manager_for_xmpp, tx_for_app, rx) {
+                match App::xmpp_connect(&config_for_app, room_manager_for_xmpp, tx_for_app, rx) {
                     Ok(mut app) => app.xmpp_run(),
                     Err(err) => error!("failed connecting to xmpp: {:?}", err),
                 }
@@ -41,28 +41,11 @@ fn main() {
                 let config = Arc::clone(&config);
                 let tx = tx.clone();
 
-                let room_manager = room_manager.clone();
                 thread::spawn(move || {
                     let room = parse_room(request, &config);
                     match App::handle_join_room(&tx, &room) {
                         Ok(room_name) => {
                             info!("sent presence for: {room_name} room");
-                            match Room::new(room_name, tx.clone(), &config.webrtc) {
-                                Ok(room) => match room_manager.lock() {
-                                    Ok(mut lock) => {
-                                        lock.insert(room);
-                                    }
-                                    Err(err) => {
-                                        error!(
-                                            "failed to lock room manager for {}: {err:?}",
-                                            room.get_name()
-                                        );
-                                    }
-                                },
-                                Err(err) => {
-                                    error!("failed to instantiate for: {err:?} room");
-                                }
-                            }
                         }
                         Err(err) => {
                             error!("failed to send presence for: {err:?} room");

@@ -1,5 +1,10 @@
 use crate::room::Room;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+pub type Rooms = Arc<Mutex<RoomManager>>;
 
 #[derive(Debug)]
 pub struct RoomManager {
@@ -14,9 +19,7 @@ impl RoomManager {
     }
 
     pub fn insert(&mut self, room: Room) {
-        self.rooms
-            .entry(room.get_name().to_string())
-            .or_insert_with(|| room);
+        self.rooms.entry(room.get_name().to_string());
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Room> {

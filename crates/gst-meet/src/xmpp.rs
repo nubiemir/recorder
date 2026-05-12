@@ -13,7 +13,13 @@ use std::{
 };
 use thiserror::Error;
 
-use crate::{config::XmppClient, iq::Iq, make_stanza, room_manager::RoomManager};
+use crate::{
+    config::{ConfigSettings, Webrtc},
+    iq::Iq,
+    make_stanza,
+    room::Room,
+    room_manager::RoomManager,
+};
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -71,12 +77,15 @@ impl App {
     }
 
     fn xmpp_connection_handler(
+        webrtc: Webrtc,
+        tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
         room_manager: Arc<Mutex<RoomManager>>,
     ) -> impl FnMut(&libstrophe::Context<'_, '_>, &mut Connection<'_, '_>, ConnectionEvent<'_, '_>)
     + Send
     + 'static {
         let rx_shared = Arc::new(Mutex::new(rx));
+        let webrtc = Arc::new(webrtc);
         move |ctx, conn, evt| match evt {
             ConnectionEvent::Connect => {
                 info!("XMPP connected");
@@ -95,7 +104,7 @@ impl App {
 
                 conn.handler_add(Self::handle_message(), None, Some("presence"), None);
                 conn.handler_add(
-                    Self::handle_iq(room_manager.clone()),
+                    Self::handle_iq(room_manager.clone(), tx.clone(), webrtc.clone()),
                     None,
                     Some("iq"),
                     None,
@@ -118,6 +127,8 @@ impl App {
 
     fn handle_iq(
         room_manager: Arc<Mutex<RoomManager>>,
+        tx: Sender<Stanza>,
+        webrtc: Arc<Webrtc>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
             debug!("iq stanza received: {}", stanza.to_string());
@@ -125,15 +136,24 @@ impl App {
 
             if let Some(child) = stanza.get_first_child() {
                 match child.name() {
-                    Some("jingle") => match room_manager.lock() {
-                        Ok(mut room_manager) => {
-                            let room_name = iq.from.split('@').next().unwrap_or_default();
-                            iq.handle_jingle(&child, room_manager.get_mut(room_name));
+                    Some("jingle") => {
+                        let room_name = iq.from.split('@').next().unwrap_or_default();
+
+                        let room =
+                            Room::new(room_name.to_string(), tx.clone(), &webrtc, iq.clone());
+
+                        if let Ok(room) = room {
+                            match room_manager.lock() {
+                                Ok(mut room_manager) => {
+                                    room_manager.insert(room);
+                                }
+                                Err(err) => {
+                                    error!("failed to get mutext guard lock for jingle: {err:?}");
+                                }
+                            }
+                            iq.handle_jingle(&child, room_manager.clone());
                         }
-                        Err(err) => {
-                            error!("failed to get mutext guard lock for jingle: {err:?}");
-                        }
-                    },
+                    }
                     Some("query") => {
                         iq.handle_query(&child);
                     }
@@ -153,16 +173,18 @@ impl App {
     }
 
     pub fn xmpp_connect(
-        xmpp_clinet: &XmppClient,
+        config: &ConfigSettings,
         room_manager: Arc<Mutex<RoomManager>>,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
     ) -> Result<Self, AppError> {
-        let conn = Self::init_xmpp_connection(&xmpp_clinet.bot_jid, &xmpp_clinet.bot_password)?;
+        let xmpp_client = &config.xmpp_client;
+        let webrtc = config.webrtc.clone();
+        let conn = Self::init_xmpp_connection(&xmpp_client.bot_jid, &xmpp_client.bot_password)?;
         let ctx = conn.connect_client(
-            Some(&xmpp_clinet.domain_url),
-            Some(xmpp_clinet.domain_port),
-            Self::xmpp_connection_handler(rx, room_manager),
+            Some(&xmpp_client.domain_url),
+            Some(xmpp_client.domain_port),
+            Self::xmpp_connection_handler(webrtc, tx.clone(), rx, room_manager),
         );
 
         match ctx {
