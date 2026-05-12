@@ -10,17 +10,16 @@ use libstrophe::Stanza;
 
 #[derive(Debug)]
 #[allow(unused)]
-pub(crate) struct Iq<'a> {
+pub(crate) struct Iq {
     pub id: String,
     pub from: String,
     pub to: String,
     pub kind: String,
-    jingle_action: Option<JingleAction<'a>>,
     jingle_media: JingleMedia,
 }
 
-impl<'a> Iq<'a> {
-    pub fn new(stanza: &'a Stanza) -> Self {
+impl Iq {
+    pub fn new(stanza: &Stanza) -> Self {
         let iq_stanza = get_attribute!(stanza, {
             from => "from",
             to => "to",
@@ -28,27 +27,27 @@ impl<'a> Iq<'a> {
             kind => "type"
         });
 
-        let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
-
         let media = JingleMedia::new();
-        let jingle_action = JingleAction::parse(&jingle_stanza.action, stanza);
 
         Self {
             id: iq_stanza.id,
             from: iq_stanza.from,
             to: iq_stanza.to,
             kind: iq_stanza.kind,
-            jingle_action,
             jingle_media: media,
         }
     }
 
-    pub fn handle_jingle_to_sdp(&mut self, room: Option<&mut Room>) {
-        if let Some(ref action) = self.jingle_action {
+    pub fn handle_jingle(&mut self, stanza: &Stanza, room: Option<&mut Room>) {
+        let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
+        let jingle_action = JingleAction::parse(&jingle_stanza.action, stanza);
+        if let Some(ref action) = jingle_action {
             match action {
                 JingleAction::SessionInitiate(stanza) => {
                     let jitsi_offer =
                         action.handle_session_initiate(stanza, &mut self.jingle_media);
+
+                    if let Some(room) = room {}
                 }
                 JingleAction::SourceAdd(stanza) => {
                     action.handle_source_add(stanza);
@@ -57,5 +56,5 @@ impl<'a> Iq<'a> {
         }
     }
 
-    pub fn handle_query_to_query(&self, _stanza: &Stanza) {}
+    pub fn handle_query(&self, _stanza: &Stanza) {}
 }

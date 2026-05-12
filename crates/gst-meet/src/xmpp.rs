@@ -128,14 +128,14 @@ impl App {
                     Some("jingle") => match room_manager.lock() {
                         Ok(mut room_manager) => {
                             let room_name = iq.from.split('@').next().unwrap_or_default();
-                            iq.handle_jingle_to_sdp(room_manager.get_mut(room_name));
+                            iq.handle_jingle(&child, room_manager.get_mut(room_name));
                         }
                         Err(err) => {
                             error!("failed to get mutext guard lock for jingle: {err:?}");
                         }
                     },
                     Some("query") => {
-                        iq.handle_query_to_query(&child);
+                        iq.handle_query(&child);
                     }
                     _ => {}
                 }
