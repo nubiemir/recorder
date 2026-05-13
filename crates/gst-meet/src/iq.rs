@@ -8,7 +8,9 @@ use crate::{
     room_manager::Rooms,
     set_attribute,
 };
+use gstreamer::prelude::ElementExtManual;
 use libstrophe::{Error, Stanza};
+use log::{error, warn};
 use nanoid::nanoid;
 use webrtc_sdp::{address::Address, attribute_type::SdpAttributeCandidate};
 
@@ -48,8 +50,29 @@ impl Iq {
         if let Some(ref action) = jingle_action {
             match action {
                 JingleAction::SessionInitiate(stanza) => {
+                    let room_name = self.from.split('@').next().unwrap_or_default();
                     let jitsi_offer =
                         action.handle_session_initiate(stanza, &mut self.jingle_media);
+
+                    match room_manager.lock() {
+                        Ok(mut room_manager_lock) => {
+                            let room = room_manager_lock.get_mut(room_name);
+                            match room {
+                                Some(room) => {
+                                    let room_clone = room.downgrade();
+                                }
+                                None => {
+                                    warn!("no room found for: {}", room_name);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            error!(
+                                "failed to obtain lock for room manager: {} err: {:?}",
+                                room_name, err
+                            );
+                        }
+                    }
                 }
                 JingleAction::SourceAdd(stanza) => {
                     action.handle_source_add(stanza);

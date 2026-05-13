@@ -1,5 +1,5 @@
 use config::{Config, ConfigError};
-use gst_meet::{config::ConfigSettings, room::Room, room_manager::RoomManager, xmpp::App};
+use gst_meet::{config::ConfigSettings, room_manager::RoomManager, xmpp::App};
 use libstrophe::Stanza;
 use log::{error, info};
 use std::{

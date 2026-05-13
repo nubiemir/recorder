@@ -139,8 +139,13 @@ impl App {
                     Some("jingle") => {
                         let room_name = iq.from.split('@').next().unwrap_or_default();
 
-                        let room =
-                            Room::new(room_name.to_string(), tx.clone(), &webrtc, iq.clone());
+                        let room = Room::new(
+                            room_name.to_string(),
+                            tx.clone(),
+                            &webrtc,
+                            iq.clone(),
+                            &child,
+                        );
 
                         if let Ok(room) = room {
                             match room_manager.lock() {
