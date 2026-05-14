@@ -8,11 +8,10 @@ use crate::{
     room_manager::Rooms,
     set_attribute,
 };
-use gstreamer::prelude::ElementExtManual;
 use libstrophe::{Error, Stanza};
 use log::{error, warn};
 use nanoid::nanoid;
-use webrtc_sdp::{address::Address, attribute_type::SdpAttributeCandidate};
+use webrtc_sdp::{address::Address, attribute_type::SdpAttributeCandidate, parse_sdp};
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -58,9 +57,14 @@ impl Iq {
                         Ok(mut room_manager_lock) => {
                             let room = room_manager_lock.get_mut(room_name);
                             match room {
-                                Some(room) => {
-                                    let room_clone = room.downgrade();
-                                }
+                                Some(room) => match parse_sdp(&jitsi_offer, true) {
+                                    Ok(sdp_offer) => {
+                                        room.handle_session_initiate(stanza, sdp_offer);
+                                    }
+                                    Err(err) => {
+                                        error!("failed to parse offer sdp: {err}");
+                                    }
+                                },
                                 None => {
                                     warn!("no room found for: {}", room_name);
                                 }

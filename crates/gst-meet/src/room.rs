@@ -1,19 +1,21 @@
 use std::{
     process::exit,
-    sync::{Arc, Weak, mpsc::Sender},
+    sync::{Arc, OnceLock, Weak, mpsc::Sender},
 };
 
 use gstreamer::{
-    Element, ElementFactory, Pad, Pipeline, State,
+    Element, ElementFactory, Pad, Pipeline, Promise, PromiseError, State, Structure, StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
     prelude::{ElementExt, ElementExtManual, GObjectExtManualGst},
 };
+use gstreamer_webrtc::WebRTCSessionDescription;
 use libstrophe::Stanza;
 use log::{error, info};
 use nanoid::nanoid;
 use webrtc_sdp::{
     SdpSession, SdpType,
     attribute_type::{SdpAttribute, parse_attribute},
+    parse_sdp,
 };
 
 use crate::{config::Webrtc, get_attribute, iq::Iq, make_stanza, sdp::Sdp, upgrade_weak, xep::XEP};
@@ -26,6 +28,8 @@ pub struct RoomInner {
     webrtcbin: Element,
     pipeline: Pipeline,
     tx: Sender<Stanza>,
+    ufrag: OnceLock<String>,
+    pwd: OnceLock<String>,
 }
 
 #[derive(Debug)]
@@ -72,13 +76,20 @@ impl Room {
         webrtcbin.set_property_from_str("stun-server", &webrtc.stun_server);
         webrtcbin.set_property_from_str("bundle-policy", &webrtc.bundle_policy);
 
-        pipeline.call_async(|pipeline| match pipeline.set_state(State::Playing) {
+        let room_name_clone = name.clone();
+        pipeline.call_async(move |pipeline| match pipeline.set_state(State::Playing) {
             Err(err) => {
-                error!("failed to state change to playing: {err:?}");
+                error!(
+                    "failed to state change to playing: {err:?} for room:{}",
+                    room_name_clone
+                );
                 exit(1);
             }
             Ok(_) => {
-                info!("successfully change state to playing");
+                info!(
+                    "successfully change state to playing for room:{}",
+                    room_name_clone
+                );
             }
         });
 
@@ -88,6 +99,8 @@ impl Room {
             pipeline,
             iq,
             tx,
+            ufrag: OnceLock::new(),
+            pwd: OnceLock::new(),
         }));
 
         let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
@@ -149,8 +162,8 @@ impl Room {
 
             let transport = make_stanza!("transport", {
                 "xmlns" => XEP::IceUdpTransport.to_string(),
-                "ufrag" => "",
-                "pwd" => ""
+                "ufrag" => self.ufrag.get().map(|s| s.as_str()).unwrap_or(""),
+                "pwd" =>self.pwd.get().map(|s| s.as_str()).unwrap_or("") 
             }, [candidate_stanza])
             .ok()?;
 
@@ -194,16 +207,104 @@ impl Room {
         info!("new pad added for: {}", &self.name);
     }
 
-    pub fn handle_session_initiate(
+    fn on_answer_created(
         &self,
-        responder: &str,
-        stanza: &Stanza,
-        sdp_session: SdpSession,
+        sid: &str,
+        initiator: &str,
+        reply: Result<Option<&StructureRef>, PromiseError>,
     ) {
-        let sdp = Sdp::new(&sdp_session);
-        let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
+        let reply = match reply {
+            Ok(Some(reply)) => reply,
+            Ok(None) => {
+                return error!("promise replied with no structure room:{}", &self.name);
+            }
+            Err(err) => {
+                return error!("failed to get a reply: {err:?} for room:{}", &self.name);
+            }
+        };
 
-        let _answer =
-            sdp.parse_sdp_to_jingle(&jingle_stanza.initiator, &jingle_stanza.sid, responder);
+        let answer = match reply.get::<WebRTCSessionDescription>("answer") {
+            Ok(desc) => desc,
+            Err(e) => {
+                return error!(
+                    "field answer was missing or wrong type: {:?} for room:{}",
+                    e, &self.name
+                );
+            }
+        };
+
+        self.webrtcbin
+            .emit_by_name::<()>("set-local-description", &[&answer, &None::<Promise>]);
+
+        match answer.sdp().as_text() {
+            Ok(sdp_answer) => match parse_sdp(&sdp_answer, true) {
+                Ok(sdp) => {
+                    let sdp = Sdp::new(&sdp);
+
+                    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                        for line in sdp_answer.lines() {
+                            if let Some(v) = line.strip_prefix("a=ice-ufrag:") {
+                                self.ufrag.set(v.to_string())?;
+                            }
+                            if let Some(v) = line.strip_prefix("a=ice-pwd:") {
+                                self.pwd.set(v.to_string())?;
+                            }
+                        }
+                        let jingle = sdp.parse_sdp_to_jingle(initiator, sid, &self.iq.from)?;
+                        let iq = make_stanza!("iq", {
+                            "id" => nanoid!(),
+                            "to" => &self.iq.from,
+                            "from" => &self.iq.to,
+                        }, [jingle])?;
+                        self.tx.send(iq)?;
+                        Ok(())
+                    })();
+
+                    match result {
+                        Ok(_) => info!(
+                            "successfully sent iq for session accept room: {}",
+                            &self.name
+                        ),
+                        Err(err) => error!(
+                            "failed to send session accept iq for room {}: {err:?}",
+                            &self.name
+                        ),
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        "failed to parse to sdp session: {err:?} for room:{}",
+                        &self.name
+                    );
+                }
+            },
+            Err(err) => {
+                error!(
+                    "failed to parse sdp answer: {err:?} for room:{}",
+                    &self.name
+                );
+            }
+        }
+    }
+
+    pub fn handle_session_initiate(&self, stanza: &Stanza, sdp_offer: SdpSession) {
+        let room_clone = self.downgrade();
+        let jingle = get_attribute!(stanza, [sid, initiator]);
+        self.pipeline.call_async(move |_pipeline| {
+            let room = upgrade_weak!(room_clone);
+            let offer_string = sdp_offer.to_string();
+
+            room.webrtcbin
+                .emit_by_name::<()>("set-remote-description", &[&offer_string, &None::<Promise>]);
+
+            let room_clone = room.downgrade();
+            let promise = Promise::with_change_func(move |reply| {
+                let room = upgrade_weak!(room_clone);
+                room.on_answer_created(&jingle.sid, &jingle.initiator, reply);
+            });
+
+            room.webrtcbin
+                .emit_by_name::<()>("create-answer", &[&None::<Structure>, &promise]);
+        });
     }
 }
