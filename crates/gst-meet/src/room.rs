@@ -6,14 +6,15 @@ use std::{
 use gstreamer::{
     Element, ElementFactory, Pad, Pipeline, Promise, PromiseError, State, Structure, StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
-    prelude::{ElementExt, ElementExtManual, GObjectExtManualGst},
+    prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt},
 };
+use gstreamer_sdp::SDPMessage;
 use gstreamer_webrtc::WebRTCSessionDescription;
 use libstrophe::Stanza;
 use log::{error, info};
 use nanoid::nanoid;
 use webrtc_sdp::{
-    SdpSession, SdpType,
+    SdpType,
     attribute_type::{SdpAttribute, parse_attribute},
     parse_sdp,
 };
@@ -35,7 +36,7 @@ pub struct RoomInner {
 #[derive(Debug)]
 pub struct RoomWeak(Weak<RoomInner>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Room(Arc<RoomInner>);
 
 impl std::ops::Deref for Room {
@@ -43,6 +44,12 @@ impl std::ops::Deref for Room {
 
     fn deref(&self) -> &RoomInner {
         &self.0
+    }
+}
+
+impl std::fmt::Display for Room {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
     }
 }
 
@@ -75,6 +82,8 @@ impl Room {
 
         webrtcbin.set_property_from_str("stun-server", &webrtc.stun_server);
         webrtcbin.set_property_from_str("bundle-policy", &webrtc.bundle_policy);
+
+        pipeline.add(&webrtcbin)?;
 
         let room_name_clone = name.clone();
         pipeline.call_async(move |pipeline| match pipeline.set_state(State::Playing) {
@@ -113,13 +122,16 @@ impl Room {
             });
 
         let room_clone = room.downgrade();
+        room.webrtcbin
+            .connect("on-data-channel", false, move |values| {
+                let room = upgrade_weak!(room_clone, None);
+                room.on_data_channel(values)
+            });
+
+        let room_clone = room.downgrade();
         room.webrtcbin.connect_pad_added(move |_webrtc, pad| {
             let room = upgrade_weak!(room_clone);
             room.on_incoming_stream(pad);
-        });
-
-        room.pipeline.call_async(|pipeline| {
-            let _ = pipeline.set_state(State::Playing);
         });
 
         Ok(room)
@@ -203,6 +215,10 @@ impl Room {
         None
     }
 
+    fn on_data_channel(&self, _values: &[Value]) -> Option<Value> {
+        None
+    }
+
     fn on_incoming_stream(&self, _pad: &Pad) {
         info!("new pad added for: {}", &self.name);
     }
@@ -223,12 +239,16 @@ impl Room {
             }
         };
 
-        let answer = match reply.get::<WebRTCSessionDescription>("answer") {
-            Ok(desc) => desc,
-            Err(e) => {
+        let answer = match reply
+            .value("answer")
+            .ok()
+            .and_then(|v| v.get::<WebRTCSessionDescription>().ok())
+        {
+            Some(desc) => desc,
+            None => {
                 return error!(
-                    "field answer was missing or wrong type: {:?} for room:{}",
-                    e, &self.name
+                    "field answer was missing or wrong type for room:{}",
+                    &self.name
                 );
             }
         };
@@ -244,18 +264,25 @@ impl Room {
                     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                         for line in sdp_answer.lines() {
                             if let Some(v) = line.strip_prefix("a=ice-ufrag:") {
-                                self.ufrag.set(v.to_string())?;
+                                if self.ufrag.get().is_none() {
+                                    self.ufrag.set(v.to_string())?;
+                                }
                             }
                             if let Some(v) = line.strip_prefix("a=ice-pwd:") {
-                                self.pwd.set(v.to_string())?;
+                                if self.pwd.get().is_none() {
+                                    self.pwd.set(v.to_string())?;
+                                }
                             }
                         }
+
                         let jingle = sdp.parse_sdp_to_jingle(initiator, sid, &self.iq.from)?;
+
                         let iq = make_stanza!("iq", {
                             "id" => nanoid!(),
                             "to" => &self.iq.from,
                             "from" => &self.iq.to,
                         }, [jingle])?;
+
                         self.tx.send(iq)?;
                         Ok(())
                     })();
@@ -287,15 +314,16 @@ impl Room {
         }
     }
 
-    pub fn handle_session_initiate(&self, stanza: &Stanza, sdp_offer: SdpSession) {
+    pub fn handle_session_initiate(&self, stanza: &Stanza, sdp_message: SDPMessage) {
         let room_clone = self.downgrade();
         let jingle = get_attribute!(stanza, [sid, initiator]);
         self.pipeline.call_async(move |_pipeline| {
             let room = upgrade_weak!(room_clone);
-            let offer_string = sdp_offer.to_string();
+            let sdp_offer =
+                WebRTCSessionDescription::new(gstreamer_webrtc::WebRTCSDPType::Offer, sdp_message);
 
             room.webrtcbin
-                .emit_by_name::<()>("set-remote-description", &[&offer_string, &None::<Promise>]);
+                .emit_by_name::<()>("set-remote-description", &[&sdp_offer, &None::<Promise>]);
 
             let room_clone = room.downgrade();
             let promise = Promise::with_change_func(move |reply| {

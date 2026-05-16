@@ -1,6 +1,8 @@
 pub(crate) mod jingle_action;
 pub(crate) mod jingle_media;
 
+use std::sync::mpsc::Sender;
+
 use crate::{
     get_attribute,
     iq::{jingle_action::JingleAction, jingle_media::JingleMedia},
@@ -8,8 +10,9 @@ use crate::{
     room_manager::Rooms,
     set_attribute,
 };
+use gstreamer_sdp::SDPMessage;
 use libstrophe::{Error, Stanza};
-use log::{error, warn};
+use log::{error, info};
 use nanoid::nanoid;
 use webrtc_sdp::{address::Address, attribute_type::SdpAttributeCandidate, parse_sdp};
 
@@ -53,26 +56,29 @@ impl Iq {
                     let jitsi_offer =
                         action.handle_session_initiate(stanza, &mut self.jingle_media);
 
-                    match room_manager.lock() {
-                        Ok(mut room_manager_lock) => {
-                            let room = room_manager_lock.get_mut(room_name);
-                            match room {
-                                Some(room) => match parse_sdp(&jitsi_offer, true) {
-                                    Ok(sdp_offer) => {
-                                        room.handle_session_initiate(stanza, sdp_offer);
-                                    }
-                                    Err(err) => {
-                                        error!("failed to parse offer sdp: {err}");
-                                    }
-                                },
-                                None => {
-                                    warn!("no room found for: {}", room_name);
-                                }
-                            }
+                    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                        let mut room_manager_lock = room_manager.lock()?;
+                        let room = room_manager_lock
+                            .get_mut(room_name)
+                            .ok_or_else(|| format!("no room found for: {}", room_name))?;
+                        let sdp_offer = parse_sdp(&jitsi_offer, true)?;
+                        let sdp_message =
+                            SDPMessage::parse_buffer(sdp_offer.to_string().as_bytes())?;
+                        room.handle_session_initiate(stanza, sdp_message);
+                        Ok(())
+                    })();
+
+                    match result {
+                        Ok(_) => {
+                            info!(
+                                "successfully processed session-initiate for room: {}",
+                                room_name
+                            );
                         }
+
                         Err(err) => {
                             error!(
-                                "failed to obtain lock for room manager: {} err: {:?}",
+                                "failed to process session-initiate for room {}: {:?}",
                                 room_name, err
                             );
                         }
@@ -85,7 +91,63 @@ impl Iq {
         }
     }
 
-    pub fn handle_query(&self, _stanza: &Stanza) {}
+    pub fn handle_query(&self, stanza: &Stanza, tx: Sender<Stanza>) -> Result<(), Error> {
+        let is_disco_info = stanza.name() == Some("query")
+            && stanza.ns() == Some("http://jabber.org/protocol/disco#info");
+
+        if !is_disco_info {
+            error!("query is not a disco info");
+            return Ok(());
+        }
+
+        let features = [
+            "urn:xmpp:jingle:1",
+            "urn:xmpp:jingle:apps:rtp:1",
+            "urn:xmpp:jingle:transports:ice-udp:1",
+            "urn:xmpp:jingle:apps:dtls:0",
+            "urn:xmpp:jingle:transports:dtls-sctp:1",
+            "urn:xmpp:jingle:apps:rtp:audio",
+            "urn:xmpp:jingle:apps:rtp:video",
+            "http://jitsi.org/json-encoded-sources",
+            "http://jitsi.org/source-name",
+            "http://jitsi.org/receive-multiple-video-streams",
+            "urn:ietf:rfc:4588",
+        ];
+
+        let identity_stanza = make_stanza!("identity", {
+            "category" => "client",
+            "type" => "pc",
+            "name" => "gst-meet-record",
+        })?;
+
+        let mut query_stanza = make_stanza!("query", {
+            "xmlns" => "http://jabber.org/protocol/disco#info"
+        }, [identity_stanza])?;
+
+        for feature_ns in features {
+            let feature_stanza = make_stanza!("feature", {
+                "var" => feature_ns,
+            })?;
+            query_stanza.add_child(feature_stanza)?;
+        }
+
+        let iq_stanza = make_stanza!("iq", {
+            "id" => &self.id,
+            "to" => &self.from,
+            "from" => &self.to,
+        }, [query_stanza])?;
+
+        match tx.send(iq_stanza) {
+            Ok(_) => {
+                info!("successfully sent query stanza");
+            }
+            Err(err) => {
+                error!("failed to send query stanza: {:?}", err)
+            }
+        }
+
+        Ok(())
+    }
 
     pub fn parse_candidate(&self, candidate: &SdpAttributeCandidate) -> Result<Stanza, Error> {
         let mut candidate_stanza = make_stanza!("candidate", {

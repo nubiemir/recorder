@@ -8,12 +8,13 @@ use std::{
     sync::{Arc, Mutex, mpsc::channel},
     thread,
 };
-use tiny_http::{Request, Server};
+use tiny_http::{Request, Response, Server};
 
 fn main() {
     let config = init_config().unwrap();
     let config = Arc::new(ConfigSettings::new(config).unwrap());
     config.logger_init();
+    gstreamer::init().unwrap();
 
     let ip = &config.server.ip;
     let port = &config.server.port;
@@ -42,10 +43,14 @@ fn main() {
                 let tx = tx.clone();
 
                 thread::spawn(move || {
-                    let room = parse_room(request, &config);
+                    let room = parse_room(&request, &config);
                     match App::handle_join_room(&tx, &room) {
                         Ok(room_name) => {
                             info!("sent presence for: {room_name} room");
+                            let response = Response::from_string(
+                                format!("successfully joined room: {}", room_name).to_string(),
+                            );
+                            let _ = request.respond(response);
                         }
                         Err(err) => {
                             error!("failed to send presence for: {err:?} room");
@@ -82,7 +87,7 @@ fn init_config() -> Result<Config, ConfigError> {
     Ok(config)
 }
 
-fn parse_room(request: Request, config: &Arc<ConfigSettings>) -> String {
+fn parse_room(request: &Request, config: &Arc<ConfigSettings>) -> String {
     let room = request
         .url()
         .trim_start_matches(config.server.start_pattern_trim.as_str());

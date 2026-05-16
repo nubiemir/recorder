@@ -9,7 +9,7 @@ start_pattern_trim = "/?room="
 [xmpp_client]
 bot_jid = "bot@hidden.meet.jitsi"
 bot_password = "botpassword"
-domain_url = "192.168.1.130"
+domain_url = "192.168.1.138"
 domain_port = 5222
 
 [webrtc]

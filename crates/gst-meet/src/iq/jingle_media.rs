@@ -1,9 +1,8 @@
-use libstrophe::Stanza;
-
 use crate::{
     get_attribute,
     util::{exists, find_all, find_first},
 };
+use libstrophe::Stanza;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct JingleMedia {
@@ -372,7 +371,7 @@ impl JingleMedia {
         sdp
     }
 
-    fn adjust_msid_semantic(&self, msid: &str, idx: &str) -> String {
+    pub fn adjust_msid_semantic(&self, msid: &str, idx: &str) -> String {
         if self.media == "audio" {
             return msid.to_string();
         }

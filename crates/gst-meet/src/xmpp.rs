@@ -160,7 +160,7 @@ impl App {
                         }
                     }
                     Some("query") => {
-                        iq.handle_query(&child);
+                        iq.handle_query(&child, tx.clone()).ok();
                     }
                     _ => {}
                 }

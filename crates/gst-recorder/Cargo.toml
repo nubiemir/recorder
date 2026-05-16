@@ -14,3 +14,4 @@ thiserror.workspace = true
 nanoid.workspace = true
 gst-meet = {path = "../gst-meet"}
 chrono.workspace = true
+gstreamer.workspace = true
