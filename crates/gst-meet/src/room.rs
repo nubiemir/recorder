@@ -9,7 +9,7 @@ use gstreamer::{
     prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt},
 };
 use gstreamer_sdp::SDPMessage;
-use gstreamer_webrtc::WebRTCSessionDescription;
+use gstreamer_webrtc::{WebRTCDataChannel, WebRTCSessionDescription};
 use libstrophe::Stanza;
 use log::{error, info};
 use nanoid::nanoid;
@@ -122,13 +122,6 @@ impl Room {
             });
 
         let room_clone = room.downgrade();
-        room.webrtcbin
-            .connect("on-data-channel", false, move |values| {
-                let room = upgrade_weak!(room_clone, None);
-                room.on_data_channel(values)
-            });
-
-        let room_clone = room.downgrade();
         room.webrtcbin.connect_pad_added(move |_webrtc, pad| {
             let room = upgrade_weak!(room_clone);
             room.on_incoming_stream(pad);
@@ -199,12 +192,13 @@ impl Room {
                 "id" => nanoid!(),
                 "to" => &self.iq.from,
                 "from" => &self.iq.to,
+                "type" => "set",
             }, [jingle])
             .ok()?;
 
             match self.tx.send(iq) {
                 Ok(_) => {
-                    info!("successfully sent candidate");
+                    info!("successfully sent candidate for: {} room", &self.name);
                 }
                 Err(_) => {
                     error!("failed to send candidate for: {} room", &self.name);
@@ -215,8 +209,51 @@ impl Room {
         None
     }
 
-    fn on_data_channel(&self, _values: &[Value]) -> Option<Value> {
-        None
+    fn on_data_channel(&self, dc: WebRTCDataChannel) {
+        let room_name = self.name.clone();
+        dc.connect_on_open(move |data_channel| {
+            info!(
+                "JVB confirmed DataChannel open for:{} room. Sending constraints...",
+                room_name
+            );
+
+            let colibri_json = serde_json::json!({
+                "colibriClass": "ReceiverVideoConstraints",
+                "lastN": -1,
+                "defaultConstraints": {
+                    "maxHeight": 720
+                }
+            });
+
+            let colibri_message = colibri_json.as_str();
+
+            match data_channel.send_string_full(colibri_message) {
+                Ok(_) => info!(
+                    "colibri constraints sent successfully for: {} room",
+                    room_name
+                ),
+                Err(err) => error!(
+                    "failed to send colibri message for: {} room, err: {:?}",
+                    room_name, err
+                ),
+            }
+        });
+
+        let room_name = self.name.clone();
+        dc.connect_on_message_string(move |_dc, data| match data {
+            Some(data) => {
+                info!(
+                    "data channel on message for: {} room, data: {:?}",
+                    room_name, data
+                );
+            }
+            None => {}
+        });
+
+        let room_name = self.name.clone();
+        dc.connect_on_error(move |_dc, err| {
+            error!("data channel error for: {} room, err: {:?}", room_name, err);
+        });
     }
 
     fn on_incoming_stream(&self, _pad: &Pad) {
@@ -256,6 +293,26 @@ impl Room {
         self.webrtcbin
             .emit_by_name::<()>("set-local-description", &[&answer, &None::<Promise>]);
 
+        match self.webrtcbin.emit_by_name::<Option<WebRTCDataChannel>>(
+            "create-data-channel",
+            &[
+                &"JVB data channel",
+                &Structure::builder("config")
+                    .field("protocol", "http://jitsi.org/protocols/colibri")
+                    .build(),
+            ],
+        ) {
+            Some(dc) => {
+                self.on_data_channel(dc);
+            }
+            None => {
+                error!(
+                    "failed to create data channel object. Check if gst-plugins-bad is installed for: {} room",
+                    &self.name
+                );
+            }
+        }
+
         match answer.sdp().as_text() {
             Ok(sdp_answer) => match parse_sdp(&sdp_answer, true) {
                 Ok(sdp) => {
@@ -281,6 +338,7 @@ impl Room {
                             "id" => nanoid!(),
                             "to" => &self.iq.from,
                             "from" => &self.iq.to,
+                            "type" => "set"
                         }, [jingle])?;
 
                         self.tx.send(iq)?;

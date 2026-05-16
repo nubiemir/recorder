@@ -146,7 +146,6 @@ impl App {
                             iq.clone(),
                             &child,
                         );
-
                         if let Ok(room) = room {
                             match room_manager.lock() {
                                 Ok(mut room_manager) => {

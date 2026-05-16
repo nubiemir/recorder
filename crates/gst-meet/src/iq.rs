@@ -135,6 +135,7 @@ impl Iq {
             "id" => &self.id,
             "to" => &self.from,
             "from" => &self.to,
+            "type" => "result",
         }, [query_stanza])?;
 
         match tx.send(iq_stanza) {
