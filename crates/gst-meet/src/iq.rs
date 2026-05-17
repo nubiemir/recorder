@@ -4,9 +4,11 @@ pub(crate) mod jingle_media;
 use std::sync::mpsc::Sender;
 
 use crate::{
+    config::Webrtc,
     get_attribute,
     iq::{jingle_action::JingleAction, jingle_media::JingleMedia},
     make_stanza,
+    room::Room,
     room_manager::Rooms,
     set_attribute,
 };
@@ -46,13 +48,56 @@ impl Iq {
         }
     }
 
-    pub fn handle_jingle(&mut self, stanza: &Stanza, room_manager: Rooms) {
+    pub fn initialize_meeting(
+        &self,
+        tx: Sender<Stanza>,
+        room_manager: Rooms,
+        sid: String,
+        initiator: String,
+        webrtc: &Webrtc,
+    ) {
+        let room_name = self.from.split('@').next().unwrap_or_default();
+
+        let room = Room::new(
+            room_name.to_string(),
+            tx.clone(),
+            webrtc,
+            self.clone(),
+            sid.to_string(),
+            initiator.to_string(),
+        );
+        if let Ok(room) = room {
+            match room_manager.lock() {
+                Ok(mut room_manager) => {
+                    room_manager.insert(room);
+                }
+                Err(err) => {
+                    error!("failed to get mutext guard lock for jingle: {err:?}");
+                }
+            }
+        }
+    }
+
+    pub fn handle_jingle(
+        &mut self,
+        stanza: &Stanza,
+        room_manager: Rooms,
+        webrtc: &Webrtc,
+        tx: Sender<Stanza>,
+    ) {
         let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
+        let room_name = self.from.split('@').next().unwrap_or_default();
         let jingle_action = JingleAction::parse(&jingle_stanza.action, stanza);
         if let Some(ref action) = jingle_action {
             match action {
                 JingleAction::SessionInitiate(stanza) => {
-                    let room_name = self.from.split('@').next().unwrap_or_default();
+                    self.initialize_meeting(
+                        tx.clone(),
+                        room_manager.clone(),
+                        jingle_stanza.sid,
+                        jingle_stanza.initiator,
+                        webrtc,
+                    );
                     let jitsi_offer =
                         action.handle_session_initiate(stanza, &mut self.jingle_media);
 
@@ -88,7 +133,33 @@ impl Iq {
                     action.handle_source_add(stanza);
                 }
             }
+            if self.kind == "set" {
+                match self.handle_ack(tx.clone()) {
+                    Ok(_) => {
+                        info!("successfully sent ack response for: {} room", room_name);
+                    }
+                    Err(err) => {
+                        error!(
+                            "failed to send ack response for: {} room | err: {:?}",
+                            room_name, err
+                        )
+                    }
+                }
+            }
         }
+    }
+
+    pub fn handle_ack(&self, tx: Sender<Stanza>) -> Result<(), Box<dyn std::error::Error>> {
+        let iq_stanza = make_stanza!("iq", {
+            "id" => &self.id,
+            "type" => "result",
+            "from" => &self.to,
+            "to" => &self.from
+
+        })?;
+
+        tx.send(iq_stanza)?;
+        Ok(())
     }
 
     pub fn handle_query(&self, stanza: &Stanza, tx: Sender<Stanza>) -> Result<(), Error> {

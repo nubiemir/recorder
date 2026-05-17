@@ -4,12 +4,16 @@ use std::{
 };
 
 use gstreamer::{
-    Element, ElementFactory, Pad, Pipeline, Promise, PromiseError, State, Structure, StructureRef,
+    Caps, Element, ElementFactory, Pad, Pipeline, Promise, PromiseError, State, Structure,
+    StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
-    prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt},
+    prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, PadExt},
 };
 use gstreamer_sdp::SDPMessage;
-use gstreamer_webrtc::{WebRTCDataChannel, WebRTCSessionDescription};
+use gstreamer_webrtc::{
+    WebRTCDataChannel, WebRTCRTPTransceiver, WebRTCRTPTransceiverDirection,
+    WebRTCSessionDescription,
+};
 use libstrophe::Stanza;
 use log::{error, info};
 use nanoid::nanoid;
@@ -75,13 +79,34 @@ impl Room {
         tx: Sender<Stanza>,
         webrtc: &Webrtc,
         iq: Iq,
-        stanza: &Stanza,
+        sid: String,
+        initiator: String,
     ) -> Result<Self, BoolError> {
         let pipeline = Pipeline::new();
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
 
         webrtcbin.set_property_from_str("stun-server", &webrtc.stun_server);
         webrtcbin.set_property_from_str("bundle-policy", &webrtc.bundle_policy);
+
+        webrtcbin.emit_by_name::<WebRTCRTPTransceiver>(
+            "add-transceiver",
+            &[
+                &WebRTCRTPTransceiverDirection::Recvonly,
+                &Caps::builder("application/x-rtp")
+                    .field("media", "audio")
+                    .build(),
+            ],
+        );
+
+        webrtcbin.emit_by_name::<WebRTCRTPTransceiver>(
+            "add-transceiver",
+            &[
+                &WebRTCRTPTransceiverDirection::Recvonly,
+                &Caps::builder("application/x-rtp")
+                    .field("media", "video")
+                    .build(),
+            ],
+        );
 
         pipeline.add(&webrtcbin)?;
 
@@ -112,13 +137,11 @@ impl Room {
             pwd: OnceLock::new(),
         }));
 
-        let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
-
         let room_clone = room.downgrade();
         room.webrtcbin
             .connect("on-ice-candidate", false, move |values| {
                 let room = upgrade_weak!(room_clone, None);
-                room.on_ice_candidate(values, &jingle_stanza.sid, &jingle_stanza.initiator)
+                room.on_ice_candidate(values, &sid, &initiator)
             });
 
         let room_clone = room.downgrade();
@@ -217,17 +240,10 @@ impl Room {
                 room_name
             );
 
-            let colibri_json = serde_json::json!({
-                "colibriClass": "ReceiverVideoConstraints",
-                "lastN": -1,
-                "defaultConstraints": {
-                    "maxHeight": 720
-                }
-            });
+            let colibri_message = r#"{"colibriClass":"ReceiverVideoConstraints","lastN":-1,"defaultConstraints":{"maxHeight":720}}"#;
 
-            let colibri_message = colibri_json.as_str();
 
-            match data_channel.send_string_full(colibri_message) {
+            match data_channel.send_string_full(Some(colibri_message)) {
                 Ok(_) => info!(
                     "colibri constraints sent successfully for: {} room",
                     room_name
@@ -256,8 +272,10 @@ impl Room {
         });
     }
 
-    fn on_incoming_stream(&self, _pad: &Pad) {
-        info!("new pad added for: {}", &self.name);
+    fn on_incoming_stream(&self, pad: &Pad) {
+        let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
+
+        info!("new pad added for: {} | caps: {:?}", &self.name, caps);
     }
 
     fn on_answer_created(

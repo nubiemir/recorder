@@ -17,7 +17,6 @@ use crate::{
     config::{ConfigSettings, Webrtc},
     iq::Iq,
     make_stanza,
-    room::Room,
     room_manager::RoomManager,
 };
 
@@ -137,26 +136,7 @@ impl App {
             if let Some(child) = stanza.get_first_child() {
                 match child.name() {
                     Some("jingle") => {
-                        let room_name = iq.from.split('@').next().unwrap_or_default();
-
-                        let room = Room::new(
-                            room_name.to_string(),
-                            tx.clone(),
-                            &webrtc,
-                            iq.clone(),
-                            &child,
-                        );
-                        if let Ok(room) = room {
-                            match room_manager.lock() {
-                                Ok(mut room_manager) => {
-                                    room_manager.insert(room);
-                                }
-                                Err(err) => {
-                                    error!("failed to get mutext guard lock for jingle: {err:?}");
-                                }
-                            }
-                            iq.handle_jingle(&child, room_manager.clone());
-                        }
+                        iq.handle_jingle(&child, room_manager.clone(), &webrtc, tx.clone());
                     }
                     Some("query") => {
                         iq.handle_query(&child, tx.clone()).ok();
