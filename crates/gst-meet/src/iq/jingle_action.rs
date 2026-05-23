@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use chrono::Utc;
 use libstrophe::Stanza;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use webrtc_sdp::{
     attribute_type::{
         SdpAttribute, SdpAttributeGroup, SdpAttributeGroupSemantic, SdpAttributeMsidSemantic,
@@ -54,7 +54,8 @@ impl<'a> JingleAction<'a> {
         final_sdp
     }
 
-    pub fn handle_source_add(&self, _stanza: &Stanza) -> String {
+    pub fn handle_source_add(&self, stanza: &Stanza) -> String {
+        info!("source added: {}", stanza.to_string());
         String::new()
     }
 

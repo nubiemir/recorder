@@ -171,6 +171,22 @@ impl Iq {
             return Ok(());
         }
 
+        let room_name = self.from.split('@').next().unwrap_or_default();
+
+        if self.kind == "set" {
+            match self.handle_ack(tx.clone()) {
+                Ok(_) => {
+                    info!("successfully sent ack response for: {} room", room_name);
+                }
+                Err(err) => {
+                    error!(
+                        "failed to send ack response for: {} room | err: {:?}",
+                        room_name, err
+                    )
+                }
+            }
+        }
+
         let features = [
             "urn:xmpp:jingle:1",
             "urn:xmpp:jingle:apps:rtp:1",

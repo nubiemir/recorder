@@ -4,16 +4,12 @@ use std::{
 };
 
 use gstreamer::{
-    Caps, Element, ElementFactory, Pad, Pipeline, Promise, PromiseError, State, Structure,
-    StructureRef,
+    Element, ElementFactory, Pad, Pipeline, Promise, PromiseError, State, Structure, StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
     prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, PadExt},
 };
 use gstreamer_sdp::SDPMessage;
-use gstreamer_webrtc::{
-    WebRTCDataChannel, WebRTCRTPTransceiver, WebRTCRTPTransceiverDirection,
-    WebRTCSessionDescription,
-};
+use gstreamer_webrtc::{WebRTCDataChannel, WebRTCSessionDescription};
 use libstrophe::Stanza;
 use log::{error, info};
 use nanoid::nanoid;
@@ -31,6 +27,7 @@ pub struct RoomInner {
     iq: Iq,
     name: String,
     webrtcbin: Element,
+    sdp_offer: String,
     pipeline: Pipeline,
     tx: Sender<Stanza>,
     ufrag: OnceLock<String>,
@@ -88,26 +85,6 @@ impl Room {
         webrtcbin.set_property_from_str("stun-server", &webrtc.stun_server);
         webrtcbin.set_property_from_str("bundle-policy", &webrtc.bundle_policy);
 
-        webrtcbin.emit_by_name::<WebRTCRTPTransceiver>(
-            "add-transceiver",
-            &[
-                &WebRTCRTPTransceiverDirection::Recvonly,
-                &Caps::builder("application/x-rtp")
-                    .field("media", "audio")
-                    .build(),
-            ],
-        );
-
-        webrtcbin.emit_by_name::<WebRTCRTPTransceiver>(
-            "add-transceiver",
-            &[
-                &WebRTCRTPTransceiverDirection::Recvonly,
-                &Caps::builder("application/x-rtp")
-                    .field("media", "video")
-                    .build(),
-            ],
-        );
-
         pipeline.add(&webrtcbin)?;
 
         let room_name_clone = name.clone();
@@ -131,6 +108,7 @@ impl Room {
             name,
             webrtcbin,
             pipeline,
+            sdp_offer: String::new(),
             iq,
             tx,
             ufrag: OnceLock::new(),
@@ -308,9 +286,6 @@ impl Room {
             }
         };
 
-        self.webrtcbin
-            .emit_by_name::<()>("set-local-description", &[&answer, &None::<Promise>]);
-
         match self.webrtcbin.emit_by_name::<Option<WebRTCDataChannel>>(
             "create-data-channel",
             &[
@@ -331,6 +306,9 @@ impl Room {
             }
         }
 
+        self.webrtcbin
+            .emit_by_name::<()>("set-local-description", &[&answer, &None::<Promise>]);
+
         match answer.sdp().as_text() {
             Ok(sdp_answer) => match parse_sdp(&sdp_answer, true) {
                 Ok(sdp) => {
@@ -350,7 +328,7 @@ impl Room {
                             }
                         }
 
-                        let jingle = sdp.parse_sdp_to_jingle(initiator, sid, &self.iq.from)?;
+                        let jingle = sdp.parse_sdp_to_jingle(initiator, sid, &self.iq.to)?;
 
                         let iq = make_stanza!("iq", {
                             "id" => nanoid!(),
@@ -395,6 +373,7 @@ impl Room {
         let jingle = get_attribute!(stanza, [sid, initiator]);
         self.pipeline.call_async(move |_pipeline| {
             let room = upgrade_weak!(room_clone);
+            // room.sdp_offer = sdp_message.clone().to_string();
             let sdp_offer =
                 WebRTCSessionDescription::new(gstreamer_webrtc::WebRTCSDPType::Offer, sdp_message);
 
