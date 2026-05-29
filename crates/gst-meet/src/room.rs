@@ -4,9 +4,10 @@ use std::{
 };
 
 use gstreamer::{
-    Element, ElementFactory, Pad, Pipeline, Promise, PromiseError, State, Structure, StructureRef,
+    Element, ElementFactory, Pad, PadDirection, PadLinkError, Pipeline, Promise, PromiseError,
+    State, StateChangeError, Structure, StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
-    prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, PadExt},
+    prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExtManual, PadExt},
 };
 use gstreamer_sdp::SDPMessage;
 use gstreamer_webrtc::{WebRTCDataChannel, WebRTCSessionDescription};
@@ -19,19 +20,50 @@ use webrtc_sdp::{
     parse_sdp,
 };
 
-use crate::{config::Webrtc, get_attribute, iq::Iq, make_stanza, sdp::Sdp, upgrade_weak, xep::XEP};
+use crate::{
+    config::Webrtc, get_attribute, iq::Iq, make_stanza, render::renderer_engine::RendererEngine,
+    sdp::Sdp, upgrade_weak, xep::XEP,
+};
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum IncomingStreamError {
+    #[error("missing caps")]
+    MissingCaps,
+
+    #[error("missing caps structure")]
+    MissingStructure,
+
+    #[error("failed to get queue sink pad")]
+    MissingQueueSinkPad,
+
+    #[error("failed to get compositor sink pad")]
+    MissingCompositorSinkPad,
+
+    #[error("glib error: {0}")]
+    Bool(#[from] BoolError),
+
+    #[error("pad link error: {0}")]
+    PadLink(#[from] PadLinkError),
+
+    #[error("state change error: {0}")]
+    StateChange(#[from] StateChangeError),
+}
 
 #[derive(Debug)]
 #[allow(unused)]
 pub struct RoomInner {
-    iq: Iq,
     name: String,
     webrtcbin: Element,
-    sdp_offer: String,
     pipeline: Pipeline,
+    muxer: Element,
+    compositor: Element,
+    filesink: Element,
     tx: Sender<Stanza>,
     ufrag: OnceLock<String>,
     pwd: OnceLock<String>,
+    renderer: RendererEngine,
 }
 
 #[derive(Debug)]
@@ -71,21 +103,37 @@ impl Room {
         RoomWeak(Arc::downgrade(&self.0))
     }
 
-    pub fn new(
-        name: String,
-        tx: Sender<Stanza>,
-        webrtc: &Webrtc,
-        iq: Iq,
-        sid: String,
-        initiator: String,
-    ) -> Result<Self, BoolError> {
+    pub fn new(name: String, tx: Sender<Stanza>, webrtc: &Webrtc) -> Result<Self, BoolError> {
         let pipeline = Pipeline::new();
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
+        let muxer = ElementFactory::make("matroskamux").build()?;
+        let filesink = ElementFactory::make("filesink").build()?;
+
+        let output_location = format!("{}.mkv", name);
+
+        filesink.set_property("location", output_location);
 
         webrtcbin.set_property_from_str("stun-server", &webrtc.stun_server);
         webrtcbin.set_property_from_str("bundle-policy", &webrtc.bundle_policy);
 
-        pipeline.add(&webrtcbin)?;
+        let compositor = ElementFactory::make("compositor").build()?;
+
+        let videoconvert = ElementFactory::make("videoconvert").build()?;
+
+        let encoder = ElementFactory::make("x264enc")
+            .property_from_str("tune", "zerolatency")
+            .build()?;
+
+        pipeline.add_many([
+            &webrtcbin,
+            &compositor,
+            &videoconvert,
+            &encoder,
+            &muxer,
+            &filesink,
+        ])?;
+
+        Element::link_many([&compositor, &videoconvert, &encoder, &muxer, &filesink])?;
 
         let room_name_clone = name.clone();
         pipeline.call_async(move |pipeline| match pipeline.set_state(State::Playing) {
@@ -107,28 +155,45 @@ impl Room {
         let room = Room(Arc::new(RoomInner {
             name,
             webrtcbin,
-            pipeline,
-            sdp_offer: String::new(),
-            iq,
+            pipeline: pipeline.clone(),
             tx,
+            filesink,
+            muxer,
+            compositor: compositor.clone(),
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),
+            renderer: RendererEngine::new(pipeline, compositor),
         }));
-
-        let room_clone = room.downgrade();
-        room.webrtcbin
-            .connect("on-ice-candidate", false, move |values| {
-                let room = upgrade_weak!(room_clone, None);
-                room.on_ice_candidate(values, &sid, &initiator)
-            });
 
         let room_clone = room.downgrade();
         room.webrtcbin.connect_pad_added(move |_webrtc, pad| {
             let room = upgrade_weak!(room_clone);
-            room.on_incoming_stream(pad);
+            let _ = room.on_incoming_stream(pad);
         });
 
         Ok(room)
+    }
+
+    pub fn handle_ice_candidate(&mut self, from: &str, to: &str, sid: &str, initiator: &str) {
+        let room_clone = self.downgrade();
+
+        let sid = sid.to_string();
+        let initiator = initiator.to_string();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        self.webrtcbin
+            .connect("on-ice-candidate", false, move |values| {
+                let room = upgrade_weak!(room_clone, None);
+
+                room.on_ice_candidate(
+                    values,
+                    from.as_str(),
+                    to.as_str(),
+                    sid.as_str(),
+                    initiator.as_str(),
+                )
+            });
     }
 
     pub fn get_name(&self) -> &str {
@@ -143,7 +208,14 @@ impl Room {
         &self.pipeline
     }
 
-    fn on_ice_candidate(&self, values: &[Value], sid: &str, initiator: &str) -> Option<Value> {
+    fn on_ice_candidate(
+        &self,
+        values: &[Value],
+        from: &str,
+        to: &str,
+        sid: &str,
+        initiator: &str,
+    ) -> Option<Value> {
         let mline_index = values[1].get::<u32>().ok()?;
         let candidate = values[2].get::<String>().ok()?;
 
@@ -164,7 +236,7 @@ impl Room {
         let parsed_candidate = parse_attribute(&candidate).ok()?;
 
         if let SdpType::Attribute(SdpAttribute::Candidate(c)) = parsed_candidate {
-            let candidate_stanza = self.iq.parse_candidate(&c).ok()?;
+            let candidate_stanza = Iq::parse_candidate(&c).ok()?;
 
             let transport = make_stanza!("transport", {
                 "xmlns" => XEP::IceUdpTransport.to_string(),
@@ -185,14 +257,14 @@ impl Room {
                 "action" => "transport-info",
                 "initiator" => initiator,
                 "sid" => sid,
-                "responder" => &self.iq.to
+                "responder" => to
             }, [content])
             .ok()?;
 
             let iq = make_stanza!("iq", {
                 "id" => nanoid!(),
-                "to" => &self.iq.from,
-                "from" => &self.iq.to,
+                "to" => from,
+                "from" => to,
                 "type" => "set",
             }, [jingle])
             .ok()?;
@@ -250,14 +322,37 @@ impl Room {
         });
     }
 
-    fn on_incoming_stream(&self, pad: &Pad) {
-        let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
+    pub fn on_incoming_stream(&self, pad: &Pad) -> Result<(), IncomingStreamError> {
+        //
+        // Only source pads
+        //
 
-        info!("new pad added for: {} | caps: {:?}", &self.name, caps);
+        if pad.direction() != PadDirection::Src {
+            return Ok(());
+        }
+
+        //
+        // Inspect caps
+        //
+
+        let caps = pad
+            .current_caps()
+            .or_else(|| Some(pad.query_caps(None)))
+            .ok_or(IncomingStreamError::MissingCaps)?;
+
+        let structure = caps
+            .structure(0)
+            .ok_or(IncomingStreamError::MissingStructure)?;
+
+        info!("structure: {}", structure.to_string());
+
+        Ok(())
     }
 
     fn on_answer_created(
         &self,
+        from: String,
+        to: String,
         sid: &str,
         initiator: &str,
         reply: Result<Option<&StructureRef>, PromiseError>,
@@ -328,12 +423,12 @@ impl Room {
                             }
                         }
 
-                        let jingle = sdp.parse_sdp_to_jingle(initiator, sid, &self.iq.to)?;
+                        let jingle = sdp.parse_sdp_to_jingle(initiator, sid, &to)?;
 
                         let iq = make_stanza!("iq", {
                             "id" => nanoid!(),
-                            "to" => &self.iq.from,
-                            "from" => &self.iq.to,
+                            "to" => &from,
+                            "from" => &to,
                             "type" => "set"
                         }, [jingle])?;
 
@@ -368,12 +463,19 @@ impl Room {
         }
     }
 
-    pub fn handle_session_initiate(&self, stanza: &Stanza, sdp_message: SDPMessage) {
+    pub fn handle_session_initiate(
+        &self,
+        stanza: &Stanza,
+        from: &str,
+        to: &str,
+        sdp_message: SDPMessage,
+    ) {
         let room_clone = self.downgrade();
         let jingle = get_attribute!(stanza, [sid, initiator]);
+        let from = from.to_string();
+        let to = to.to_string();
         self.pipeline.call_async(move |_pipeline| {
             let room = upgrade_weak!(room_clone);
-            // room.sdp_offer = sdp_message.clone().to_string();
             let sdp_offer =
                 WebRTCSessionDescription::new(gstreamer_webrtc::WebRTCSDPType::Offer, sdp_message);
 
@@ -383,11 +485,26 @@ impl Room {
             let room_clone = room.downgrade();
             let promise = Promise::with_change_func(move |reply| {
                 let room = upgrade_weak!(room_clone);
-                room.on_answer_created(&jingle.sid, &jingle.initiator, reply);
+                room.on_answer_created(from, to, &jingle.sid, &jingle.initiator, reply);
             });
 
             room.webrtcbin
                 .emit_by_name::<()>("create-answer", &[&None::<Structure>, &promise]);
         });
+    }
+
+    pub fn on_participant_joined(
+        &self,
+        endpoint_id: &str,
+        nickname: &str,
+        video_muted: bool,
+        audio_muted: bool,
+    ) {
+        self.renderer
+            .on_participant_joined(endpoint_id, nickname, video_muted, audio_muted);
+    }
+
+    pub fn on_participant_left(&self, endpoint_id: &str) {
+        self.renderer.on_participant_left(endpoint_id);
     }
 }

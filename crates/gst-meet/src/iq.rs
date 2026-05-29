@@ -4,11 +4,9 @@ pub(crate) mod jingle_media;
 use std::sync::mpsc::Sender;
 
 use crate::{
-    config::Webrtc,
     get_attribute,
     iq::{jingle_action::JingleAction, jingle_media::JingleMedia},
     make_stanza,
-    room::Room,
     room_manager::Rooms,
     set_attribute,
 };
@@ -48,43 +46,23 @@ impl Iq {
         }
     }
 
-    pub fn initialize_meeting(
-        &self,
-        tx: Sender<Stanza>,
-        room_manager: Rooms,
-        sid: String,
-        initiator: String,
-        webrtc: &Webrtc,
-    ) {
+    pub fn initialize_meeting(&self, room_manager: Rooms, sid: String, initiator: String) {
         let room_name = self.from.split('@').next().unwrap_or_default();
 
-        let room = Room::new(
-            room_name.to_string(),
-            tx.clone(),
-            webrtc,
-            self.clone(),
-            sid.to_string(),
-            initiator.to_string(),
-        );
-        if let Ok(room) = room {
-            match room_manager.lock() {
-                Ok(mut room_manager) => {
-                    room_manager.insert(room);
-                }
-                Err(err) => {
-                    error!("failed to get mutext guard lock for jingle: {err:?}");
-                }
+        match room_manager.lock() {
+            Ok(mut room_manager) => {
+                room_manager.get_mut(room_name).and_then(|room| {
+                    room.handle_ice_candidate(&self.from, &self.to, &sid, &initiator);
+                    Some(room)
+                });
+            }
+            Err(err) => {
+                error!("failed to get mutext guard lock for jingle: {err:?}");
             }
         }
     }
 
-    pub fn handle_jingle(
-        &mut self,
-        stanza: &Stanza,
-        room_manager: Rooms,
-        webrtc: &Webrtc,
-        tx: Sender<Stanza>,
-    ) {
+    pub fn handle_jingle(&mut self, stanza: &Stanza, room_manager: Rooms, tx: Sender<Stanza>) {
         let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
         let room_name = self.from.split('@').next().unwrap_or_default();
         let jingle_action = JingleAction::parse(&jingle_stanza.action, stanza);
@@ -92,11 +70,9 @@ impl Iq {
             match action {
                 JingleAction::SessionInitiate(stanza) => {
                     self.initialize_meeting(
-                        tx.clone(),
                         room_manager.clone(),
                         jingle_stanza.sid,
                         jingle_stanza.initiator,
-                        webrtc,
                     );
                     let jitsi_offer =
                         action.handle_session_initiate(stanza, &mut self.jingle_media);
@@ -109,7 +85,7 @@ impl Iq {
                         let sdp_offer = parse_sdp(&jitsi_offer, true)?;
                         let sdp_message =
                             SDPMessage::parse_buffer(sdp_offer.to_string().as_bytes())?;
-                        room.handle_session_initiate(stanza, sdp_message);
+                        room.handle_session_initiate(stanza, &self.from, &self.to, sdp_message);
                         Ok(())
                     })();
 
@@ -131,6 +107,10 @@ impl Iq {
                 }
                 JingleAction::SourceAdd(stanza) => {
                     action.handle_source_add(stanza);
+                }
+
+                JingleAction::SourceRemove(stanza) => {
+                    action.handle_source_remove(stanza);
                 }
             }
             if self.kind == "set" {
@@ -237,7 +217,7 @@ impl Iq {
         Ok(())
     }
 
-    pub fn parse_candidate(&self, candidate: &SdpAttributeCandidate) -> Result<Stanza, Error> {
+    pub fn parse_candidate(candidate: &SdpAttributeCandidate) -> Result<Stanza, Error> {
         let mut candidate_stanza = make_stanza!("candidate", {
             "port" => candidate.port.to_string(),
             "component" => candidate.component.to_string(),

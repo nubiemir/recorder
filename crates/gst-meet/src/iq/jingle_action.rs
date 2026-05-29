@@ -18,6 +18,7 @@ use crate::{iq::jingle_media::JingleMedia, util::find_all};
 pub enum JingleAction<'a> {
     SessionInitiate(&'a Stanza),
     SourceAdd(&'a Stanza),
+    SourceRemove(&'a Stanza),
 }
 
 impl<'a> JingleAction<'a> {
@@ -25,6 +26,7 @@ impl<'a> JingleAction<'a> {
         match s {
             "session-initiate" => Some(Self::SessionInitiate(stanza)),
             "source-add" => Some(Self::SourceAdd(stanza)),
+            "source-remove" => Some(Self::SourceRemove(stanza)),
             _ => None,
         }
     }
@@ -56,6 +58,11 @@ impl<'a> JingleAction<'a> {
 
     pub fn handle_source_add(&self, stanza: &Stanza) -> String {
         info!("source added: {}", stanza.to_string());
+        String::new()
+    }
+
+    pub fn handle_source_remove(&self, stanza: &Stanza) -> String {
+        info!("source removed: {}", stanza.to_string());
         String::new()
     }
 
@@ -292,6 +299,7 @@ impl<'a> Display for JingleAction<'a> {
         match self {
             Self::SessionInitiate(_) => write!(f, "session-initiate"),
             Self::SourceAdd(_) => write!(f, "source-add"),
+            Self::SourceRemove(_) => write!(f, "source-remove"),
         }
     }
 }
