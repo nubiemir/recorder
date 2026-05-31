@@ -1,2 +1,11 @@
+pub mod config;
+pub mod iq;
 pub mod macros;
+pub mod presence;
+pub mod render;
+pub mod room;
+pub mod room_manager;
+pub mod sdp;
+pub mod util;
+pub mod xep;
 pub mod xmpp;
