@@ -17,6 +17,8 @@ use crate::{
     config::{ConfigSettings, Webrtc},
     iq::Iq,
     make_stanza,
+    presence::{ParticipantPresence, PresenceLifecycle},
+    room::Room,
     room_manager::RoomManager,
 };
 
@@ -101,9 +103,14 @@ impl App {
                     Duration::from_millis(0),
                 );
 
-                conn.handler_add(Self::handle_message(), None, Some("presence"), None);
                 conn.handler_add(
-                    Self::handle_iq(room_manager.clone(), tx.clone(), webrtc.clone()),
+                    Self::handle_presence(room_manager.clone(), tx.clone(), webrtc.clone()),
+                    None,
+                    Some("presence"),
+                    None,
+                );
+                conn.handler_add(
+                    Self::handle_iq(room_manager.clone(), tx.clone()),
                     None,
                     Some("iq"),
                     None,
@@ -127,7 +134,6 @@ impl App {
     fn handle_iq(
         room_manager: Arc<Mutex<RoomManager>>,
         tx: Sender<Stanza>,
-        webrtc: Arc<Webrtc>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
             debug!("iq stanza received: {}", stanza.to_string());
@@ -136,7 +142,7 @@ impl App {
             if let Some(child) = stanza.get_first_child() {
                 match child.name() {
                     Some("jingle") => {
-                        iq.handle_jingle(&child, room_manager.clone(), &webrtc, tx.clone());
+                        iq.handle_jingle(&child, room_manager.clone(), tx.clone());
                     }
                     Some("query") => {
                         iq.handle_query(&child, tx.clone()).ok();
@@ -149,9 +155,88 @@ impl App {
         }
     }
 
-    fn handle_message() -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
+    fn handle_presence(
+        room_manager: Arc<Mutex<RoomManager>>,
+        tx: Sender<Stanza>,
+        webrtc: Arc<Webrtc>,
+    ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
-            debug!("message stanza received: {}", stanza.to_string());
+            if let Some(p_life_cycle) = ParticipantPresence::from_presence(stanza) {
+                match p_life_cycle {
+                    PresenceLifecycle::ParticipantJoined(participant) => {
+                        let room_name = participant.from.split('@').next().unwrap_or_default();
+
+                        match room_manager.lock() {
+                            Ok(mut room_manager) => {
+                                if !room_manager.contains_key(room_name) {
+                                    let room = match Room::new(
+                                        room_name.to_string(),
+                                        tx.clone(),
+                                        &webrtc,
+                                    ) {
+                                        Ok(room) => room,
+                                        Err(err) => {
+                                            error!(
+                                                "failed to create room for {room_name} | err: {err:?}"
+                                            );
+                                            return HandlerResult::KeepHandler;
+                                        }
+                                    };
+
+                                    room_manager.insert(room);
+                                }
+
+                                if let Some(room) = room_manager.get(room_name) {
+                                    room.on_participant_joined(
+                                        &participant.endpoint_id,
+                                        &participant.display_name.unwrap_or_default(),
+                                        participant.video_muted,
+                                        participant.audio_muted,
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                error!(
+                                    "failed to get mutex guard lock for participant joined for {room_name} room | err: {err:?}"
+                                );
+                            }
+                        }
+                        info!("processed participant joined for: {room_name} room");
+                    }
+
+                    PresenceLifecycle::ParticipantLeft(participant) => {
+                        let room_name = participant.from.split('@').next().unwrap_or_default();
+                        match room_manager.lock() {
+                            Ok(mut room_manager) => {
+                                if let Some(room) = room_manager.get_mut(room_name) {
+                                    room.on_participant_left(&participant.endpoint_id);
+                                }
+                            }
+                            Err(err) => {
+                                error!(
+                                    "failed to get mutext guard lock for participant left for: {room_name} room | err: {err:?}"
+                                );
+                            }
+                        }
+                    }
+
+                    PresenceLifecycle::MeetingTerminated(participant) => {
+                        let room_name = participant.from.split('@').next().unwrap_or_default();
+                        match room_manager.lock() {
+                            Ok(mut room_manager) => {
+                                if let Some(room) = room_manager.get_mut(room_name) {
+                                    room.on_meeting_terminated();
+                                }
+                            }
+                            Err(err) => {
+                                error!(
+                                    "failed to get mutext guard lock for meeting terminated for {room_name} room | err: {err:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             HandlerResult::KeepHandler
         }
     }
