@@ -1,10 +1,9 @@
 use gstreamer::{Pad, glib::object::ObjectExt};
-use log::warn;
 
 pub const SCREEN_W: i32 = 1920;
 pub const SCREEN_H: i32 = 1080;
-pub const SMALL_TILE_W: i32 = 120;
-pub const SMALL_TILE_H: i32 = 70;
+pub const SMALL_TILE_W: i32 = 250;
+pub const SMALL_TILE_H: i32 = 100;
 
 #[derive(Debug)]
 pub struct TileRect {
@@ -77,20 +76,8 @@ impl LayoutEngine {
             return rects;
         }
 
-        if count == 1 {
-            rects.push(TileRect {
-                endpoint: tiles[0].0.to_string(),
-                xpos: 0,
-                ypos: 0,
-                width: SCREEN_W,
-                height: SCREEN_H,
-                is_screenshare: false,
-                is_highlighted: false,
-                is_dominant_large: false,
-                zorder: 0,
-            });
-            return rects;
-        }
+        // NOTE: The `if count == 1` block was removed from here.
+        // Now, 1 user will be treated as a dominant speaker with 1 thumbnail.
 
         if let Some(dom_id) = dominant_id {
             let small_count = tiles.len();

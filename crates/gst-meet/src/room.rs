@@ -106,9 +106,7 @@ impl Room {
     pub fn new(name: String, tx: Sender<Stanza>, webrtc: &Webrtc) -> Result<Self, BoolError> {
         let pipeline = Pipeline::new();
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
-        let muxer = ElementFactory::make("matroskamux")
-            .property("streamable", true)
-            .build()?;
+        let muxer = ElementFactory::make("matroskamux").build()?;
         let filesink = ElementFactory::make("filesink").build()?;
 
         let output_location = format!("{}.mkv", name);

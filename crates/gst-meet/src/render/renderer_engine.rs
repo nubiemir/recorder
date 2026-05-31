@@ -36,7 +36,6 @@ impl RendererEngine {
 
     // ── Participant lifecycle ─────────────────────────────────────────────
 
-    /// Called from presence handler when a real participant is seen
     pub fn on_participant_joined(
         &self,
         endpoint_id: &str,
@@ -62,18 +61,11 @@ impl RendererEngine {
             endpoint_id, nickname
         );
 
-        // always add black tile first so tile exists before promote_to_dominant
         if let Err(e) = self.add_black_tile_for(endpoint_id, nickname, video_muted, audio_muted) {
             error!("failed to add black tile for {}: {:?}", endpoint_id, e);
             return;
         }
 
-        info!(
-            "endpoint_id: {} | nickname: {} | video_muted: {} | audio_muted: {}",
-            endpoint_id, nickname, video_muted, audio_muted
-        );
-
-        // NOW promote — tile exists so large_pad can be stored on it
         let no_dominant = self.dominant_speaker.lock().unwrap().is_none();
         if no_dominant {
             info!("setting initial dominant speaker → {}", endpoint_id);
@@ -83,7 +75,6 @@ impl RendererEngine {
         self.recalculate_layout();
     }
 
-    /// Called from presence type="unavailable"
     pub fn on_participant_left(&self, endpoint_id: &str) {
         info!("participant left endpoint={}", endpoint_id);
         self.remove_tile(endpoint_id);
@@ -92,7 +83,6 @@ impl RendererEngine {
 
     // ── Source info / mute state ──────────────────────────────────────────
 
-    /// Called every time presence SourceInfo changes
     pub fn on_source_info_updated(
         &self,
         endpoint_id: &str,
@@ -115,7 +105,6 @@ impl RendererEngine {
         tile.audio_muted = audio_muted;
         tile.has_screenshare = has_screenshare;
 
-        // camera just turned off while video was active → swap to black tile
         if !prev_video_muted && video_muted && tile.content == TileContent::Camera {
             info!("camera off for {}, switching to black tile", endpoint_id);
             drop(tiles);
@@ -128,7 +117,7 @@ impl RendererEngine {
         self.recalculate_layout();
     }
 
-    // ── SSRC map (from source-add jingle) ────────────────────────────────
+    // ── SSRC map ─────────────────────────────────────────────────────────
 
     pub fn register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
         let is_screenshare = source_name.ends_with("-v1");
@@ -155,10 +144,8 @@ impl RendererEngine {
             .unwrap_or(false)
     }
 
-    // ── RTP stream arrived (from on_incoming_stream) ──────────────────────
+    // ── RTP stream arrived ────────────────────────────────────────────────
 
-    /// Call this when webrtcbin gives us a new src pad for a participant.
-    /// Returns the compositor sink pad to link into.
     pub fn on_video_stream_arrived(&self, endpoint_id: &str, is_screenshare: bool) -> Option<Pad> {
         info!(
             "video stream arrived endpoint={} screenshare={}",
@@ -169,11 +156,9 @@ impl RendererEngine {
             return self.add_screenshare_pad(endpoint_id);
         }
 
-        // remove black tile, return new compositor pad for real video
         self.swap_to_video(endpoint_id)
     }
 
-    /// Call this when a video stream disappears (pad removed)
     pub fn on_video_stream_removed(&self, endpoint_id: &str, is_screenshare: bool) {
         if is_screenshare {
             self.remove_screenshare_pad(endpoint_id);
@@ -186,7 +171,8 @@ impl RendererEngine {
     // ── Dominant speaker ─────────────────────────────────────────────────
 
     fn promote_to_dominant(&self, endpoint_id: &str) {
-        // remove large pad from previous dominant
+        let mut tiles = self.tiles.lock().unwrap();
+
         let prev = {
             let mut dominant = self.dominant_speaker.lock().unwrap();
             let prev = dominant.clone();
@@ -194,22 +180,48 @@ impl RendererEngine {
             prev
         };
 
+        // 1. Demote previous dominant
         if let Some(prev_id) = prev {
             if prev_id != endpoint_id {
-                let mut tiles = self.tiles.lock().unwrap();
                 if let Some(tile) = tiles.get_mut(&prev_id) {
                     if let Some(pad) = tile.large_pad.take() {
                         self.compositor.release_request_pad(&pad);
+                    }
+                    if let (Some(tee), Some(tee_pad)) = (&tile.tee, tile.large_tee_pad.take()) {
+                        tee.release_request_pad(&tee_pad);
+                    }
+                    if let Some(queue) = tile.large_queue.take() {
+                        let _ = queue.set_state(State::Null);
+                        let _ = self.pipeline.remove(&queue);
                     }
                 }
             }
         }
 
-        // add large pad for new dominant
-        let large_pad = self.compositor.request_pad_simple("sink_%u");
-        let mut tiles = self.tiles.lock().unwrap();
+        // 2. Promote new dominant
         if let Some(tile) = tiles.get_mut(endpoint_id) {
-            tile.large_pad = large_pad;
+            if let Some(tee) = &tile.tee {
+                let large_pad = self.compositor.request_pad_simple("sink_%u").unwrap();
+
+                let large_queue = ElementFactory::make("queue").build().unwrap();
+                self.pipeline.add(&large_queue).unwrap();
+
+                let tee_src_pad = tee.request_pad_simple("src_%u").unwrap();
+                tee_src_pad
+                    .link(&large_queue.static_pad("sink").unwrap())
+                    .unwrap();
+                large_queue
+                    .static_pad("src")
+                    .unwrap()
+                    .link(&large_pad)
+                    .unwrap();
+
+                large_queue.sync_state_with_parent().unwrap();
+
+                tile.large_pad = Some(large_pad);
+                tile.large_queue = Some(large_queue);
+                tile.large_tee_pad = Some(tee_src_pad);
+            }
         }
     }
 
@@ -253,29 +265,49 @@ impl RendererEngine {
 
         let convert = ElementFactory::make("videoconvert").build()?;
 
-        self.pipeline
-            .add_many([&src, &capsfilter, &textoverlay, &convert])?;
+        // Setup Tee & Thumbnail Queue
+        let tee = ElementFactory::make("tee").build()?;
+        let thumb_queue = ElementFactory::make("queue").build()?;
 
-        Element::link_many([&src, &capsfilter, &textoverlay, &convert])?;
+        self.pipeline.add_many([
+            &src,
+            &capsfilter,
+            &textoverlay,
+            &convert,
+            &tee,
+            &thumb_queue,
+        ])?;
+
+        // Link Black Gen -> Tee
+        Element::link_many([&src, &capsfilter, &textoverlay, &convert, &tee])?;
+
+        // Link Tee -> Thumbnail Queue
+        Element::link_many([&tee, &thumb_queue])?;
 
         let compositor_pad = self
             .compositor
             .request_pad_simple("sink_%u")
             .ok_or_else(|| bool_error!("no compositor pad"))?;
 
-        convert
+        // Link Thumbnail Queue -> Compositor
+        thumb_queue
             .static_pad("src")
-            .ok_or_else(|| bool_error!("failed to get static pad"))?
+            .unwrap()
             .link(&compositor_pad)
             .map_err(|e| bool_error!("failed to link convert to compositor: {e}"))?;
 
-        src.sync_state_with_parent()?;
-        capsfilter.sync_state_with_parent()?;
-        textoverlay.sync_state_with_parent()?;
-        convert.sync_state_with_parent()?;
+        for el in [
+            &src,
+            &capsfilter,
+            &textoverlay,
+            &convert,
+            &tee,
+            &thumb_queue,
+        ] {
+            el.sync_state_with_parent()?;
+        }
 
         let mut tiles = self.tiles.lock().unwrap();
-
         let tile = tiles.entry(endpoint_id.to_string()).or_insert_with(|| {
             Tile::new(
                 endpoint_id.to_string(),
@@ -292,40 +324,10 @@ impl RendererEngine {
         tile.text_overlay = Some(textoverlay);
         tile.convert = Some(convert);
 
+        tile.tee = Some(tee);
+        tile.thumb_queue = Some(thumb_queue);
+
         Ok(())
-    }
-
-    fn swap_to_black_tile(&self, endpoint_id: &str) {
-        let mut tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(err) => {
-                error!("failed to acquire tiles lock: {err}");
-                return;
-            }
-        };
-
-        if let Some(tile) = tiles.get_mut(endpoint_id) {
-            if let Some(pad) = tile.compositor_pad.take() {
-                self.compositor.release_request_pad(&pad);
-            }
-            tile.content = TileContent::BlackTile;
-        }
-
-        tiles.get(endpoint_id).and_then(|tile| {
-            if let Err(e) = self.add_black_tile_for(
-                endpoint_id,
-                &tile.nickname,
-                tile.video_muted,
-                tile.audio_muted,
-            ) {
-                error!(
-                    "failed to add black tile on swap for {}: {:?}",
-                    endpoint_id, e
-                );
-            }
-
-            Some(tile)
-        });
     }
 
     fn swap_to_video(&self, endpoint_id: &str) -> Option<Pad> {
@@ -337,47 +339,97 @@ impl RendererEngine {
             }
         };
 
-        if let Some(tile) = tiles.get_mut(endpoint_id) {
-            // stop and remove black tile elements
-            for el in [
-                tile.black_src.take(),
-                tile.caps_filter.take(),
-                tile.text_overlay.take(),
-                tile.convert.take(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let _ = el.set_state(State::Null);
-                let _ = self.pipeline.remove(&el);
-            }
+        let tile = tiles.get_mut(endpoint_id)?;
 
-            if let Some(pad) = tile.compositor_pad.take() {
-                self.compositor.release_request_pad(&pad);
-            }
-
-            tile.content = TileContent::Camera;
+        // Tear down ONLY the black generator elements upstream of the Tee
+        for el in [
+            tile.black_src.take(),
+            tile.caps_filter.take(),
+            tile.text_overlay.take(),
+            tile.convert.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = el.set_state(State::Null);
+            let _ = self.pipeline.remove(&el);
         }
 
-        let pad = self.compositor.request_pad_simple("sink_%u")?;
+        tile.content = TileContent::Camera;
 
-        if let Some(tile) = tiles.get_mut(endpoint_id) {
-            tile.compositor_pad = Some(pad.clone());
+        // DO NOT request a new compositor pad here. The Tee is already routed to the
+        // compositor via thumb_queue (and large_queue if dominant).
+        // Just return the Tee's sink pad so the incoming WebRTC feed can plug right into it!
+        tile.tee.as_ref().and_then(|tee| tee.static_pad("sink"))
+    }
+
+    fn swap_to_black_tile(&self, endpoint_id: &str) {
+        let mut tiles = match self.tiles.lock() {
+            Ok(tiles) => tiles,
+            Err(err) => return,
+        };
+
+        let tile = match tiles.get_mut(endpoint_id) {
+            Some(t) => t,
+            None => return,
+        };
+
+        // We assume the caller unlinked the WebRTC source from the Tee before calling this.
+        if let Some(tee) = &tile.tee {
+            // Rebuild the black generator
+            let src = ElementFactory::make("videotestsrc")
+                .property_from_str("pattern", "black")
+                .property("is-live", true)
+                .build()
+                .unwrap();
+            let textoverlay = ElementFactory::make("textoverlay")
+                .property("text", &tile.nickname)
+                .property_from_str("valignment", "center")
+                .property_from_str("halignment", "center")
+                .property("font-desc", "Sans Bold 24")
+                .build()
+                .unwrap();
+            let caps = Caps::builder("video/x-raw")
+                .field("width", 1920i32)
+                .field("height", 1080i32)
+                .field("framerate", gstreamer::Fraction::new(30, 1))
+                .field("format", "I420")
+                .build();
+            let capsfilter = ElementFactory::make("capsfilter")
+                .property("caps", &caps)
+                .build()
+                .unwrap();
+            let convert = ElementFactory::make("videoconvert").build().unwrap();
+
+            self.pipeline
+                .add_many([&src, &capsfilter, &textoverlay, &convert])
+                .unwrap();
+            Element::link_many([&src, &capsfilter, &textoverlay, &convert]).unwrap();
+
+            // Link to existing Tee
+            convert
+                .static_pad("src")
+                .unwrap()
+                .link(&tee.static_pad("sink").unwrap())
+                .unwrap();
+
+            for el in [&src, &capsfilter, &textoverlay, &convert] {
+                el.sync_state_with_parent().unwrap();
+            }
+
+            tile.black_src = Some(src);
+            tile.caps_filter = Some(capsfilter);
+            tile.text_overlay = Some(textoverlay);
+            tile.convert = Some(convert);
+            tile.content = TileContent::BlackTile;
         }
-
-        self.recalculate_layout();
-        Some(pad)
     }
 
     fn add_screenshare_pad(&self, endpoint_id: &str) -> Option<Pad> {
         let pad = self.compositor.request_pad_simple("sink_%u")?;
-
         let mut tiles = match self.tiles.lock() {
             Ok(tiles) => tiles,
-            Err(err) => {
-                error!("failed to acquire tiles lock: {err}");
-                return None;
-            }
+            Err(_) => return None,
         };
 
         if let Some(tile) = tiles.get_mut(endpoint_id) {
@@ -392,10 +444,7 @@ impl RendererEngine {
     fn remove_screenshare_pad(&self, endpoint_id: &str) {
         let mut tiles = match self.tiles.lock() {
             Ok(tiles) => tiles,
-            Err(err) => {
-                error!("failed to acquire tiles lock: {err}");
-                return;
-            }
+            Err(_) => return,
         };
 
         if let Some(tile) = tiles.get_mut(endpoint_id) {
@@ -409,18 +458,19 @@ impl RendererEngine {
     fn remove_tile(&self, endpoint_id: &str) {
         let mut tiles = match self.tiles.lock() {
             Ok(tiles) => tiles,
-            Err(err) => {
-                error!("failed to acquire tiles lock: {err}");
-                return;
-            }
+            Err(_) => return,
         };
 
         if let Some(mut tile) = tiles.remove(endpoint_id) {
+            // Clean up ALL elements associated with this participant
             for el in [
                 tile.black_src.take(),
                 tile.caps_filter.take(),
                 tile.text_overlay.take(),
                 tile.convert.take(),
+                tile.thumb_queue.take(),
+                tile.large_queue.take(),
+                tile.tee.take(),
             ]
             .into_iter()
             .flatten()
@@ -429,10 +479,13 @@ impl RendererEngine {
                 let _ = self.pipeline.remove(&el);
             }
 
+            // Release ALL requested compositor pads
             if let Some(pad) = tile.compositor_pad.take() {
                 self.compositor.release_request_pad(&pad);
             }
-
+            if let Some(pad) = tile.large_pad.take() {
+                self.compositor.release_request_pad(&pad);
+            }
             if let Some(pad) = tile.screenshare_compositor_pad.take() {
                 self.compositor.release_request_pad(&pad);
             }
@@ -476,10 +529,7 @@ impl RendererEngine {
                     }
                 })
             },
-            |ep| {
-                // large pad getter for dominant
-                tiles.get(ep).and_then(|t| t.large_pad.clone())
-            },
+            |ep| tiles.get(ep).and_then(|t| t.large_pad.clone()),
         );
     }
 }

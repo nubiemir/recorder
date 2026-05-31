@@ -25,6 +25,10 @@ pub struct Tile {
     pub has_screenshare: bool,
     pub video_muted: bool,
     pub audio_muted: bool,
+    pub tee: Option<Element>,
+    pub thumb_queue: Option<Element>,
+    pub large_queue: Option<Element>,
+    pub large_tee_pad: Option<Pad>,
 }
 
 impl Tile {
@@ -44,6 +48,10 @@ impl Tile {
             has_screenshare: false,
             video_muted,
             audio_muted,
+            thumb_queue: None,
+            large_queue: None,
+            large_tee_pad: None,
+            tee: None,
         }
     }
 }
