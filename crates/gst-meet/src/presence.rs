@@ -8,7 +8,7 @@ use crate::{get_attribute, util::find_first};
 pub enum PresenceLifecycle {
     ParticipantJoined(ParticipantPresence),
     ParticipantLeft(ParticipantPresence),
-    MeetingTerminated,
+    MeetingTerminated(ParticipantPresence),
 }
 
 #[derive(Debug, Clone)]
@@ -27,11 +27,10 @@ impl ParticipantPresence {
         let presence_stanza = get_attribute!(stanza, {
             name => "name",
             from => "from",
-            kind => "kind"
+            kind => "type"
         });
 
         let endpoint_id = presence_stanza.from.rsplit('/').next()?.to_string();
-        let display_name = find_first(Some(&stanza), "nick")?.text();
 
         let item_stanza = find_first(Some(&stanza), "x>item")?;
 
@@ -46,9 +45,9 @@ impl ParticipantPresence {
         let (video_muted, audio_muted, is_screen_share) =
             Self::parse_source_info(stanza, &endpoint_id);
 
-        let participant = Self {
+        let mut participant = Self {
             endpoint_id,
-            display_name,
+            display_name: None,
             real_jid,
             from: presence_stanza.from,
             video_muted,
@@ -57,12 +56,14 @@ impl ParticipantPresence {
         };
 
         if presence_stanza.kind.is_empty() {
+            let display_name = find_first(Some(&stanza), "nick")?.text();
+            participant.display_name = display_name;
             return Some(PresenceLifecycle::ParticipantJoined(participant));
         } else {
             let destroy_stanza = find_first(Some(&stanza), "x>destroy");
 
             match destroy_stanza {
-                Some(_) => return Some(PresenceLifecycle::MeetingTerminated),
+                Some(_) => return Some(PresenceLifecycle::MeetingTerminated(participant)),
                 None => return Some(PresenceLifecycle::ParticipantLeft(participant)),
             }
         }
@@ -71,30 +72,32 @@ impl ParticipantPresence {
     fn parse_source_info(stanza: &Stanza, endpoint_id: &str) -> (bool, bool, bool) {
         let source_info_text = match find_first(Some(stanza), "SourceInfo").and_then(|n| n.text()) {
             Some(t) => t,
-            None => return (false, false, false),
+            None => return (true, true, false),
         };
 
         let video_key = format!("{}-v0", endpoint_id);
+        let audio_key = format!("{}-a0", endpoint_id);
         let screen_key = format!("{}-v1", endpoint_id);
 
         let map: HashMap<String, serde_json::Value> = match serde_json::from_str(&source_info_text)
         {
             Ok(m) => m,
-            Err(_) => return (false, false, false),
+            Err(_) => return (true, true, false),
         };
 
         let video_muted = map
             .get(&video_key)
             .and_then(|v| v.get("muted"))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let is_screen_share = map.contains_key(&screen_key);
 
-        let audio_muted = find_first(Some(stanza), "audiomuted")
-            .and_then(|n| n.text())
-            .map(|t| t == "true")
-            .unwrap_or(false);
+        let audio_muted = map
+            .get(&audio_key)
+            .and_then(|v| v.get("muted"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         (video_muted, audio_muted, is_screen_share)
     }

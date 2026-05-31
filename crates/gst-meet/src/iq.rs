@@ -106,7 +106,31 @@ impl Iq {
                     }
                 }
                 JingleAction::SourceAdd(stanza) => {
-                    action.handle_source_add(stanza);
+                    let sources = action.handle_source_add(stanza);
+                    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                        let mut room_manager_lock = room_manager.lock()?;
+                        let room = room_manager_lock
+                            .get_mut(room_name)
+                            .ok_or_else(|| format!("no room found for: {}", room_name))?;
+
+                        for source in sources {
+                            room.handle_register_ssrc(source.0, &source.1, &source.2);
+                        }
+                        Ok(())
+                    })();
+
+                    match result {
+                        Ok(_) => {
+                            info!("successfully processed session-add for room: {}", room_name);
+                        }
+
+                        Err(err) => {
+                            error!(
+                                "failed to process session-add for room {}: {:?}",
+                                room_name, err
+                            );
+                        }
+                    }
                 }
 
                 JingleAction::SourceRemove(stanza) => {

@@ -27,4 +27,11 @@ impl RoomManager {
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Room> {
         self.rooms.get_mut(name)
     }
+    pub fn get(&mut self, name: &str) -> Option<&Room> {
+        self.rooms.get(name)
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.rooms.contains_key(name)
+    }
 }

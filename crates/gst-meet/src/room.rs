@@ -4,9 +4,9 @@ use std::{
 };
 
 use gstreamer::{
-    Element, ElementFactory, Pad, PadDirection, PadLinkError, Pipeline, Promise, PromiseError,
-    State, StateChangeError, Structure, StructureRef,
-    glib::{BoolError, Value, object::ObjectExt},
+    Element, ElementFactory, MessageView, Pad, PadDirection, PadLinkError, Pipeline, Promise,
+    PromiseError, State, StateChangeError, Structure, StructureRef,
+    glib::{BoolError, ControlFlow, Value, object::ObjectExt},
     prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExtManual, PadExt},
 };
 use gstreamer_sdp::SDPMessage;
@@ -106,7 +106,9 @@ impl Room {
     pub fn new(name: String, tx: Sender<Stanza>, webrtc: &Webrtc) -> Result<Self, BoolError> {
         let pipeline = Pipeline::new();
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
-        let muxer = ElementFactory::make("matroskamux").build()?;
+        let muxer = ElementFactory::make("matroskamux")
+            .property("streamable", true)
+            .build()?;
         let filesink = ElementFactory::make("filesink").build()?;
 
         let output_location = format!("{}.mkv", name);
@@ -132,6 +134,34 @@ impl Room {
             &muxer,
             &filesink,
         ])?;
+
+        let room_name_clone = name.clone();
+        let bus = pipeline.bus().unwrap();
+        let _ = bus.add_watch(move |_, msg| {
+            match msg.view() {
+                MessageView::Error(err) => {
+                    error!(
+                        "GStreamer error for room {}: {} ({:?})",
+                        room_name_clone,
+                        err.error(),
+                        err.debug()
+                    );
+                }
+                MessageView::Warning(warn) => {
+                    error!(
+                        "GStreamer warning for room {}: {} ({:?})",
+                        room_name_clone,
+                        warn.error(),
+                        warn.debug()
+                    );
+                }
+                MessageView::Eos(_) => {
+                    info!("GStreamer EOS for room: {}", room_name_clone);
+                }
+                _ => {}
+            }
+            ControlFlow::Continue
+        })?;
 
         Element::link_many([&compositor, &videoconvert, &encoder, &muxer, &filesink])?;
 
@@ -323,17 +353,9 @@ impl Room {
     }
 
     pub fn on_incoming_stream(&self, pad: &Pad) -> Result<(), IncomingStreamError> {
-        //
-        // Only source pads
-        //
-
         if pad.direction() != PadDirection::Src {
             return Ok(());
         }
-
-        //
-        // Inspect caps
-        //
 
         let caps = pad
             .current_caps()
@@ -344,11 +366,77 @@ impl Room {
             .structure(0)
             .ok_or(IncomingStreamError::MissingStructure)?;
 
-        info!("structure: {}", structure.to_string());
+        if !structure.name().starts_with("application/x-rtp") {
+            return Ok(());
+        }
+
+        let encoding_name = structure.get::<String>("encoding-name").unwrap_or_default();
+
+        if encoding_name != "AV1" {
+            info!("skipping non-AV1 stream: {}", encoding_name);
+            return Ok(());
+        }
+
+        let ssrc = structure.get::<u32>("ssrc").unwrap_or(0);
+
+        let endpoint_id = match self.renderer.endpoint_for_ssrc(ssrc) {
+            Some(id) => id,
+            None => {
+                info!("no endpoint for ssrc {}, ignoring", ssrc);
+                return Ok(());
+            }
+        };
+
+        let is_screenshare = self.renderer.is_screenshare_ssrc(ssrc);
+
+        let compositor_sink_pad = match self
+            .renderer
+            .on_video_stream_arrived(&endpoint_id, is_screenshare)
+        {
+            Some(pad) => pad,
+            None => {
+                error!(
+                    "renderer could not provide compositor pad for {}",
+                    endpoint_id
+                );
+                return Ok(());
+            }
+        };
+
+        let queue = ElementFactory::make("queue").build()?;
+        let depay = ElementFactory::make("rtpav1depay").build()?;
+        let parser = ElementFactory::make("av1parse").build()?;
+        let decoder = ElementFactory::make("dav1ddec").build()?;
+        let convert = ElementFactory::make("videoconvert").build()?;
+
+        self.pipeline
+            .add_many([&queue, &depay, &parser, &decoder, &convert])?;
+        Element::link_many([&queue, &depay, &parser, &decoder, &convert])?;
+
+        let queue_sink_pad = queue
+            .static_pad("sink")
+            .ok_or(IncomingStreamError::MissingQueueSinkPad)?;
+
+        pad.link(&queue_sink_pad)?;
+
+        convert
+            .static_pad("src")
+            .unwrap()
+            .link(&compositor_sink_pad)?;
+
+        queue.sync_state_with_parent()?;
+        depay.sync_state_with_parent()?;
+        parser.sync_state_with_parent()?;
+        decoder.sync_state_with_parent()?;
+        convert.sync_state_with_parent()?;
+
+        info!(
+            "stream linked for endpoint={} screenshare={}",
+            endpoint_id, is_screenshare
+        );
 
         Ok(())
     }
-
     fn on_answer_created(
         &self,
         from: String,
@@ -506,5 +594,25 @@ impl Room {
 
     pub fn on_participant_left(&self, endpoint_id: &str) {
         self.renderer.on_participant_left(endpoint_id);
+    }
+
+    pub fn on_meeting_terminated(&self) {
+        if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
+            error!("failed to send EOS for room: {}", self.name);
+        }
+
+        if let Some(bus) = self.pipeline.bus() {
+            let _ = bus.timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(5),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            );
+        }
+
+        let _ = self.pipeline.set_state(State::Null);
+        info!("pipeline stopped, file finalized for room: {}", self.name);
+    }
+
+    pub fn handle_register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
+        self.renderer.register_ssrc(ssrc, endpoint_id, source_name);
     }
 }

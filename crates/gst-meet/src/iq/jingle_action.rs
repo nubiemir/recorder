@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use chrono::Utc;
 use libstrophe::Stanza;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use webrtc_sdp::{
     attribute_type::{
         SdpAttribute, SdpAttributeGroup, SdpAttributeGroupSemantic, SdpAttributeMsidSemantic,
@@ -12,7 +12,10 @@ use webrtc_sdp::{
     parse_sdp,
 };
 
-use crate::{iq::jingle_media::JingleMedia, util::find_all};
+use crate::{
+    iq::jingle_media::JingleMedia,
+    util::{find_all, find_first},
+};
 
 #[derive(Debug)]
 pub enum JingleAction<'a> {
@@ -56,9 +59,71 @@ impl<'a> JingleAction<'a> {
         final_sdp
     }
 
-    pub fn handle_source_add(&self, stanza: &Stanza) -> String {
-        info!("source added: {}", stanza.to_string());
-        String::new()
+    pub fn handle_source_add(&self, stanza: &Stanza) -> Vec<(u32, String, String)> {
+        let mut res = vec![];
+        let json_raw =
+            match find_first(Some(&stanza), "json-message").and_then(|stanza| stanza.text()) {
+                Some(text) => text,
+                None => {
+                    error!("unable to find source add json message");
+                    return res;
+                }
+            };
+
+        let json: serde_json::Value = match serde_json::from_str(&json_raw) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("source-add: failed to parse json: {e}");
+                return res;
+            }
+        };
+
+        let sources = match json["sources"].as_object() {
+            Some(s) => s,
+            None => {
+                error!("source-add: no sources object");
+                return res;
+            }
+        };
+
+        for (endpoint_id, data) in sources {
+            let rtx_ssrcs: std::collections::HashSet<u32> = data[1]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|g| g.as_array())
+                .filter(|g| g.first().and_then(|v| v.as_str()) == Some("f"))
+                .filter_map(|g| g.get(2).and_then(|v| v.as_u64()).map(|v| v as u32))
+                .collect();
+
+            let media_sources = match data[0].as_array() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            for source in media_sources {
+                let ssrc = match source["s"].as_u64() {
+                    Some(s) => s as u32,
+                    None => continue,
+                };
+
+                let source_name = source["n"].as_str().unwrap_or("");
+
+                if rtx_ssrcs.contains(&ssrc) {
+                    info!("source-add: skipping RTX ssrc={}", ssrc);
+                    continue;
+                }
+
+                info!(
+                    "source-add: registering ssrc={} endpoint={} source={}",
+                    ssrc, endpoint_id, source_name
+                );
+
+                res.push((ssrc, endpoint_id.to_string(), source_name.to_string()));
+            }
+        }
+
+        res
     }
 
     pub fn handle_source_remove(&self, stanza: &Stanza) -> String {

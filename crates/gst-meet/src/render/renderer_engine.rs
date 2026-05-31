@@ -1,10 +1,11 @@
 use std::{collections::HashMap, sync::Mutex};
 
 use gstreamer::{
-    Element, ElementFactory, Pad, Pipeline, State,
+    Caps, Element, ElementFactory, Pad, Pipeline, State,
     glib::{BoolError, bool_error},
     prelude::{ElementExt, ElementExtManual, GstBinExt, GstBinExtManual, PadExt},
 };
+
 use log::{error, info};
 
 use crate::render::{
@@ -43,16 +44,17 @@ impl RendererEngine {
         video_muted: bool,
         audio_muted: bool,
     ) {
-        let tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(err) => {
-                error!("failed to acquire tiles lock: {err}");
+        {
+            let tiles = match self.tiles.lock() {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("tiles lock: {e}");
+                    return;
+                }
+            };
+            if tiles.contains_key(endpoint_id) {
                 return;
             }
-        };
-
-        if tiles.contains_key(endpoint_id) {
-            return; // already tracking
         }
 
         info!(
@@ -60,29 +62,22 @@ impl RendererEngine {
             endpoint_id, nickname
         );
 
-        if video_muted {
-            if let Err(e) = self.add_black_tile_for(endpoint_id, nickname, video_muted, audio_muted)
-            {
-                error!("failed to add black tile for {}: {:?}", endpoint_id, e);
-                return;
-            }
-        } else {
-            let tile = Tile::new(
-                endpoint_id.to_string(),
-                nickname.to_string(),
-                video_muted,
-                audio_muted,
-            );
+        // always add black tile first so tile exists before promote_to_dominant
+        if let Err(e) = self.add_black_tile_for(endpoint_id, nickname, video_muted, audio_muted) {
+            error!("failed to add black tile for {}: {:?}", endpoint_id, e);
+            return;
+        }
 
-            match self.tiles.lock() {
-                Ok(mut tiles) => {
-                    tiles.insert(endpoint_id.to_string(), tile);
-                }
-                Err(err) => {
-                    error!("failed to acquire tiles lock: {err}");
-                    return;
-                }
-            }
+        info!(
+            "endpoint_id: {} | nickname: {} | video_muted: {} | audio_muted: {}",
+            endpoint_id, nickname, video_muted, audio_muted
+        );
+
+        // NOW promote — tile exists so large_pad can be stored on it
+        let no_dominant = self.dominant_speaker.lock().unwrap().is_none();
+        if no_dominant {
+            info!("setting initial dominant speaker → {}", endpoint_id);
+            self.promote_to_dominant(endpoint_id);
         }
 
         self.recalculate_layout();
@@ -190,9 +185,37 @@ impl RendererEngine {
 
     // ── Dominant speaker ─────────────────────────────────────────────────
 
+    fn promote_to_dominant(&self, endpoint_id: &str) {
+        // remove large pad from previous dominant
+        let prev = {
+            let mut dominant = self.dominant_speaker.lock().unwrap();
+            let prev = dominant.clone();
+            *dominant = Some(endpoint_id.to_string());
+            prev
+        };
+
+        if let Some(prev_id) = prev {
+            if prev_id != endpoint_id {
+                let mut tiles = self.tiles.lock().unwrap();
+                if let Some(tile) = tiles.get_mut(&prev_id) {
+                    if let Some(pad) = tile.large_pad.take() {
+                        self.compositor.release_request_pad(&pad);
+                    }
+                }
+            }
+        }
+
+        // add large pad for new dominant
+        let large_pad = self.compositor.request_pad_simple("sink_%u");
+        let mut tiles = self.tiles.lock().unwrap();
+        if let Some(tile) = tiles.get_mut(endpoint_id) {
+            tile.large_pad = large_pad;
+        }
+    }
+
     pub fn on_dominant_speaker(&self, endpoint_id: &str) {
         info!("dominant speaker → {}", endpoint_id);
-        *self.dominant_speaker.lock().unwrap() = Some(endpoint_id.to_string());
+        self.promote_to_dominant(endpoint_id);
         self.recalculate_layout();
     }
 
@@ -217,23 +240,37 @@ impl RendererEngine {
             .property("font-desc", "Sans Bold 24")
             .build()?;
 
+        let caps = Caps::builder("video/x-raw")
+            .field("width", 1920i32)
+            .field("height", 1080i32)
+            .field("framerate", gstreamer::Fraction::new(30, 1))
+            .field("format", "I420")
+            .build();
+
+        let capsfilter = ElementFactory::make("capsfilter")
+            .property("caps", &caps)
+            .build()?;
+
         let convert = ElementFactory::make("videoconvert").build()?;
 
-        self.pipeline.add_many([&src, &textoverlay, &convert])?;
+        self.pipeline
+            .add_many([&src, &capsfilter, &textoverlay, &convert])?;
 
-        Element::link_many([&src, &textoverlay, &convert])?;
+        Element::link_many([&src, &capsfilter, &textoverlay, &convert])?;
 
         let compositor_pad = self
             .compositor
             .request_pad_simple("sink_%u")
             .ok_or_else(|| bool_error!("no compositor pad"))?;
 
-        let _ = convert
+        convert
             .static_pad("src")
             .ok_or_else(|| bool_error!("failed to get static pad"))?
-            .link(&compositor_pad);
+            .link(&compositor_pad)
+            .map_err(|e| bool_error!("failed to link convert to compositor: {e}"))?;
 
         src.sync_state_with_parent()?;
+        capsfilter.sync_state_with_parent()?;
         textoverlay.sync_state_with_parent()?;
         convert.sync_state_with_parent()?;
 
@@ -250,6 +287,7 @@ impl RendererEngine {
 
         tile.content = TileContent::BlackTile;
         tile.compositor_pad = Some(compositor_pad);
+        tile.caps_filter = Some(capsfilter);
         tile.black_src = Some(src);
         tile.text_overlay = Some(textoverlay);
         tile.convert = Some(convert);
@@ -303,6 +341,7 @@ impl RendererEngine {
             // stop and remove black tile elements
             for el in [
                 tile.black_src.take(),
+                tile.caps_filter.take(),
                 tile.text_overlay.take(),
                 tile.convert.take(),
             ]
@@ -379,6 +418,7 @@ impl RendererEngine {
         if let Some(mut tile) = tiles.remove(endpoint_id) {
             for el in [
                 tile.black_src.take(),
+                tile.caps_filter.take(),
                 tile.text_overlay.take(),
                 tile.convert.take(),
             ]
@@ -425,14 +465,21 @@ impl RendererEngine {
 
         let rects = LayoutEngine::calculate(&tile_info, dominant.as_deref());
 
-        LayoutEngine::apply(&rects, |ep, is_screenshare| {
-            tiles.get(ep).and_then(|t| {
-                if is_screenshare {
-                    t.screenshare_compositor_pad.clone()
-                } else {
-                    t.compositor_pad.clone()
-                }
-            })
-        });
+        LayoutEngine::apply(
+            &rects,
+            |ep, is_screenshare| {
+                tiles.get(ep).and_then(|t| {
+                    if is_screenshare {
+                        t.screenshare_compositor_pad.clone()
+                    } else {
+                        t.compositor_pad.clone()
+                    }
+                })
+            },
+            |ep| {
+                // large pad getter for dominant
+                tiles.get(ep).and_then(|t| t.large_pad.clone())
+            },
+        );
     }
 }
