@@ -11,39 +11,37 @@ use std::{
 use tiny_http::{Request, Response, Server};
 
 fn main() {
-    let config = init_config().unwrap();
-    let config = Arc::new(ConfigSettings::new(config).unwrap());
-    config.logger_init();
-    gstreamer::init().unwrap();
+    let config = init_config().expect("failed to initialize config");
+    let config = Arc::new(config);
+
+    gstreamer::init().expect("failed to initialize gstreamer");
 
     let ip = &config.server.ip;
     let port = &config.server.port;
     let server = Server::http(&format!("{ip}:{port}"));
+
     match server {
         Ok(server) => {
             info!("started listening on: {:?}", server.server_addr());
             let (tx, rx) = channel::<Stanza>();
             let room_manager = Arc::new(Mutex::new(RoomManager::new()));
 
-            // Clone config values the XMPP thread needs
-            let config_for_app = config.clone();
+            let app_config = config.clone();
             let tx_for_app = tx.clone();
 
-            // Spawn XMPP thread — App is created and owned entirely here
-            let room_manager_for_xmpp = room_manager.clone();
             let xmpp_handle = thread::spawn(move || {
-                match App::xmpp_connect(&config_for_app, room_manager_for_xmpp, tx_for_app, rx) {
+                match App::connect(&app_config, room_manager, tx_for_app, rx) {
                     Ok(mut app) => app.xmpp_run(),
                     Err(err) => error!("failed connecting to xmpp: {:?}", err),
                 }
             });
 
             for request in server.incoming_requests() {
-                let config = Arc::clone(&config);
+                let request_config = config.clone();
                 let tx = tx.clone();
 
                 thread::spawn(move || {
-                    let room = parse_room(&request, &config);
+                    let room = parse_room(&request, &request_config);
                     match App::handle_join_room(&tx, &room) {
                         Ok(room_name) => {
                             info!("sent presence for: {room_name} room");
@@ -70,7 +68,7 @@ fn main() {
     }
 }
 
-fn init_config() -> Result<Config, ConfigError> {
+fn init_config() -> Result<ConfigSettings, ConfigError> {
     let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
 
     let config = Config::builder()
@@ -84,7 +82,11 @@ fn init_config() -> Result<Config, ConfigError> {
         .add_source(config::Environment::with_prefix("APP"))
         .build()?;
 
-    Ok(config)
+    let settings = ConfigSettings::new(config)?;
+
+    settings.logger_init();
+
+    Ok(settings)
 }
 
 fn parse_room(request: &Request, config: &Arc<ConfigSettings>) -> String {

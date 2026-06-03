@@ -19,7 +19,7 @@ use crate::{
     make_stanza,
     presence::{ParticipantPresence, PresenceLifecycle},
     room::Room,
-    room_manager::RoomManager,
+    room_manager::{RoomManager, Rooms},
 };
 
 #[derive(Error, Debug)]
@@ -241,9 +241,9 @@ impl App {
         }
     }
 
-    pub fn xmpp_connect(
+    pub fn connect(
         config: &ConfigSettings,
-        room_manager: Arc<Mutex<RoomManager>>,
+        room_manager: Rooms,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
     ) -> Result<Self, AppError> {
