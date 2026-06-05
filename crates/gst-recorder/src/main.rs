@@ -24,7 +24,7 @@ fn main() {
         Ok(server) => {
             info!("started listening on: {:?}", server.server_addr());
             let (tx, rx) = channel::<Stanza>();
-            let room_manager = Arc::new(Mutex::new(RoomManager::new()));
+            let room_manager = RoomManager::new();
 
             let app_config = config.clone();
             let tx_for_app = tx.clone();

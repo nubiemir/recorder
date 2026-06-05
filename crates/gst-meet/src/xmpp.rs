@@ -18,7 +18,6 @@ use crate::{
     iq::Iq,
     make_stanza,
     presence::{ParticipantPresence, PresenceLifecycle},
-    room::Room,
     room_manager::{RoomManager, Rooms},
 };
 
@@ -81,17 +80,16 @@ impl App {
         webrtc: Webrtc,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
-        room_manager: Arc<Mutex<RoomManager>>,
-    ) -> impl FnMut(&libstrophe::Context<'_, '_>, &mut Connection<'_, '_>, ConnectionEvent<'_, '_>)
-    + Send
-    + 'static {
+        room_manager: RoomManager,
+    ) -> impl FnMut(&libstrophe::Context, &mut Connection, ConnectionEvent) + Send {
         let rx_shared = Arc::new(Mutex::new(rx));
         let webrtc = Arc::new(webrtc);
+        let room_manager = Arc::new(Mutex::new(room_manager));
         move |ctx, conn, evt| match evt {
             ConnectionEvent::Connect => {
                 info!("XMPP connected");
 
-                let rx_clone = Arc::clone(&rx_shared);
+                let rx_clone = rx_shared.clone();
                 conn.timed_handler_add(
                     move |_ctx, conn| {
                         while let Ok(stanza) = rx_clone.lock().unwrap().try_recv() {
@@ -132,7 +130,7 @@ impl App {
     }
 
     fn handle_iq(
-        room_manager: Arc<Mutex<RoomManager>>,
+        room_manager: Rooms,
         tx: Sender<Stanza>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
@@ -156,7 +154,7 @@ impl App {
     }
 
     fn handle_presence(
-        room_manager: Arc<Mutex<RoomManager>>,
+        room_manager: Rooms,
         tx: Sender<Stanza>,
         webrtc: Arc<Webrtc>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
@@ -164,76 +162,38 @@ impl App {
             if let Some(p_life_cycle) = ParticipantPresence::from_presence(stanza) {
                 match p_life_cycle {
                     PresenceLifecycle::ParticipantJoined(participant) => {
-                        let room_name = participant.from.split('@').next().unwrap_or_default();
+                        let room_name = participant
+                            .from
+                            .split('@')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string();
 
-                        match room_manager.lock() {
-                            Ok(mut room_manager) => {
-                                if !room_manager.contains_key(room_name) {
-                                    let room = match Room::new(
-                                        room_name.to_string(),
-                                        tx.clone(),
-                                        &webrtc,
-                                    ) {
-                                        Ok(room) => room,
-                                        Err(err) => {
-                                            error!(
-                                                "failed to create room for {room_name} | err: {err:?}"
-                                            );
-                                            return HandlerResult::KeepHandler;
-                                        }
-                                    };
-
-                                    room_manager.insert(room);
-                                }
-
-                                if let Some(room) = room_manager.get(room_name) {
-                                    room.on_participant_joined(
-                                        &participant.endpoint_id,
-                                        &participant.display_name.unwrap_or_default(),
-                                        participant.video_muted,
-                                        participant.audio_muted,
-                                    );
-                                }
+                        let mut rm = room_manager.lock().unwrap();
+                        match rm.on_participant_joined(&room_name, tx.clone(), &webrtc, participant)
+                        {
+                            Ok(_) => {
+                                info!("processed participant joined for: {room_name} room");
                             }
                             Err(err) => {
                                 error!(
-                                    "failed to get mutex guard lock for participant joined for {room_name} room | err: {err:?}"
+                                    "failed to process participant joined for: {room_name} | err: {err:?}"
                                 );
                             }
                         }
-                        info!("processed participant joined for: {room_name} room");
                     }
 
                     PresenceLifecycle::ParticipantLeft(participant) => {
                         let room_name = participant.from.split('@').next().unwrap_or_default();
-                        match room_manager.lock() {
-                            Ok(mut room_manager) => {
-                                if let Some(room) = room_manager.get_mut(room_name) {
-                                    room.on_participant_left(&participant.endpoint_id);
-                                }
-                            }
-                            Err(err) => {
-                                error!(
-                                    "failed to get mutext guard lock for participant left for: {room_name} room | err: {err:?}"
-                                );
-                            }
-                        }
+                        let rm = room_manager.lock().unwrap();
+                        rm.on_participant_left(room_name, &participant.endpoint_id);
+                        info!("processed participant left for: {room_name} room");
                     }
 
                     PresenceLifecycle::MeetingTerminated(participant) => {
                         let room_name = participant.from.split('@').next().unwrap_or_default();
-                        match room_manager.lock() {
-                            Ok(mut room_manager) => {
-                                if let Some(room) = room_manager.get_mut(room_name) {
-                                    room.on_meeting_terminated();
-                                }
-                            }
-                            Err(err) => {
-                                error!(
-                                    "failed to get mutext guard lock for meeting terminated for {room_name} room | err: {err:?}"
-                                );
-                            }
-                        }
+                        let rm = room_manager.lock().unwrap();
+                        rm.on_meeting_terminated(room_name);
                     }
                 }
             }
@@ -243,7 +203,7 @@ impl App {
 
     pub fn connect(
         config: &ConfigSettings,
-        room_manager: Rooms,
+        room_manager: RoomManager,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
     ) -> Result<Self, AppError> {

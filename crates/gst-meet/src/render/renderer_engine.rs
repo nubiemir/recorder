@@ -8,10 +8,7 @@ use gstreamer::{
 
 use log::{error, info};
 
-use crate::render::{
-    layout::LayoutEngine,
-    tile::{Tile, TileContent},
-};
+use crate::render::layout::{LayoutEngine, Tile, TileContent};
 
 #[derive(Debug)]
 #[allow(unused)]
