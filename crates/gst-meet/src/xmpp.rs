@@ -159,6 +159,7 @@ impl App {
         webrtc: Arc<Webrtc>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx, _conn, stanza| {
+            debug!("presence stanza received: {}", stanza.to_string());
             if let Some(p_life_cycle) = ParticipantPresence::from_presence(stanza) {
                 match p_life_cycle {
                     PresenceLifecycle::ParticipantJoined(participant) => {
@@ -170,6 +171,7 @@ impl App {
                             .to_string();
 
                         let mut rm = room_manager.lock().unwrap();
+
                         match rm.on_participant_joined(&room_name, tx.clone(), &webrtc, participant)
                         {
                             Ok(_) => {

@@ -46,16 +46,23 @@ impl RoomManager {
         participant: ParticipantPresence,
     ) -> Result<(), BoolError> {
         if !self.contains_key(name) {
-            let room = Room::new(name.to_string(), tx.clone(), &webrtc)?;
-            self.insert(room);
-        }
-
-        if let Some(room) = self.get_mut(name) {
+            let mut room = Room::new(name.to_string(), tx.clone(), &webrtc)?;
             room.on_participant_joined(
                 &participant.endpoint_id,
                 &participant.display_name.unwrap_or_default(),
                 participant.video_muted,
                 participant.audio_muted,
+            );
+            self.insert(room);
+            return Ok(());
+        }
+
+        if let Some(room) = self.get_mut(name) {
+            room.source_info_updated(
+                &participant.endpoint_id,
+                participant.video_muted,
+                participant.audio_muted,
+                participant.is_screen_share,
             );
         }
         Ok(())

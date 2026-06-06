@@ -9,7 +9,7 @@ use gstreamer::{
     prelude::{ElementExt, ElementExtManual, GstBinExt, GstBinExtManual, PadExt},
 };
 
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::render::{
     layout::{LayoutEngine, Tile, TileContent},
@@ -120,8 +120,6 @@ impl RendererEngine {
         info!("RendererEngine loop exited — channel closed");
     }
 
-    // ── Participant lifecycle ─────────────────────────────────────────────
-
     fn on_participant_joined(
         &mut self,
         endpoint_id: &str,
@@ -157,8 +155,6 @@ impl RendererEngine {
         self.recalculate_layout();
     }
 
-    // ── Source info / mute state ──────────────────────────────────────────
-
     fn on_source_info_updated(
         &mut self,
         endpoint_id: &str,
@@ -189,8 +185,6 @@ impl RendererEngine {
         self.recalculate_layout();
     }
 
-    // ── SSRC map ─────────────────────────────────────────────────────────
-
     fn register_ssrc(&mut self, ssrc: u32, endpoint_id: &str, source_name: &str) {
         let is_screenshare = source_name.ends_with("-v1");
         self.ssrc_map
@@ -207,8 +201,6 @@ impl RendererEngine {
             .map(|(_, is_share)| *is_share)
             .unwrap_or(false)
     }
-
-    // ── RTP stream arrived ────────────────────────────────────────────────
 
     fn on_video_stream_arrived(&mut self, endpoint_id: &str, is_screenshare: bool) -> Option<Pad> {
         info!(
@@ -231,8 +223,6 @@ impl RendererEngine {
         }
         self.recalculate_layout();
     }
-
-    // ── Dominant speaker ─────────────────────────────────────────────────
 
     fn promote_to_dominant(&mut self, endpoint_id: &str) {
         let prev = self.dominant_speaker.replace(endpoint_id.to_string());
@@ -287,8 +277,6 @@ impl RendererEngine {
         self.promote_to_dominant(endpoint_id);
         self.recalculate_layout();
     }
-
-    // ── Internal ─────────────────────────────────────────────────────────
 
     fn add_black_tile_for(
         &mut self,
@@ -525,6 +513,8 @@ impl RendererEngine {
     }
 
     fn recalculate_layout(&self) {
+        let tile = self.tiles.values();
+        warn!("tile: {:?}", tile);
         let tile_info: Vec<(&String, bool, bool)> = self
             .tiles
             .iter()

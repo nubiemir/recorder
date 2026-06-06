@@ -4,9 +4,9 @@ use std::{
 };
 
 use gstreamer::{
-    Element, ElementFactory, MessageView, Pad, PadDirection, PadLinkError, Pipeline, Promise,
-    PromiseError, State, StateChangeError, Structure, StructureRef,
-    glib::{BoolError, ControlFlow, Value, object::ObjectExt},
+    Element, ElementFactory, Pad, PadDirection, PadLinkError, Pipeline, Promise, PromiseError,
+    State, StateChangeError, Structure, StructureRef,
+    glib::{BoolError, Value, object::ObjectExt},
     prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExtManual, PadExt},
 };
 use gstreamer_sdp::SDPMessage;
@@ -138,34 +138,6 @@ impl Room {
             &muxer,
             &filesink,
         ])?;
-
-        let room_name_clone = name.clone();
-        let bus = pipeline.bus().unwrap();
-        let _ = bus.add_watch(move |_, msg| {
-            match msg.view() {
-                MessageView::Error(err) => {
-                    error!(
-                        "GStreamer error for room {}: {} ({:?})",
-                        room_name_clone,
-                        err.error(),
-                        err.debug()
-                    );
-                }
-                MessageView::Warning(warn) => {
-                    error!(
-                        "GStreamer warning for room {}: {} ({:?})",
-                        room_name_clone,
-                        warn.error(),
-                        warn.debug()
-                    );
-                }
-                MessageView::Eos(_) => {
-                    info!("GStreamer EOS for room: {}", room_name_clone);
-                }
-                _ => {}
-            }
-            ControlFlow::Continue
-        })?;
 
         Element::link_many([&compositor, &videoconvert, &encoder, &muxer, &filesink])?;
 
@@ -594,6 +566,21 @@ impl Room {
     ) {
         self.renderer_handler
             .participant_joined(endpoint_id, nickname, video_muted, audio_muted);
+    }
+
+    pub fn source_info_updated(
+        &mut self,
+        endpoint_id: &str,
+        video_muted: bool,
+        audio_muted: bool,
+        has_screenshare: bool,
+    ) {
+        self.renderer_handler.source_info_updated(
+            endpoint_id,
+            video_muted,
+            audio_muted,
+            has_screenshare,
+        );
     }
 
     pub fn on_participant_left(&mut self, endpoint_id: &str) {
