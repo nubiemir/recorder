@@ -50,7 +50,7 @@ impl RoomManager {
             self.insert(room);
         }
 
-        if let Some(room) = self.get(name) {
+        if let Some(room) = self.get_mut(name) {
             room.on_participant_joined(
                 &participant.endpoint_id,
                 &participant.display_name.unwrap_or_default(),
@@ -61,8 +61,8 @@ impl RoomManager {
         Ok(())
     }
 
-    pub fn on_participant_left(&self, name: &str, endpoint_id: &str) {
-        if let Some(room) = self.get(name) {
+    pub fn on_participant_left(&mut self, name: &str, endpoint_id: &str) {
+        if let Some(room) = self.get_mut(name) {
             room.on_participant_left(endpoint_id);
         }
     }

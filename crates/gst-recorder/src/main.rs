@@ -5,7 +5,7 @@ use log::{error, info};
 use std::{
     env,
     process::exit,
-    sync::{Arc, Mutex, mpsc::channel},
+    sync::{Arc, mpsc::channel},
     thread,
 };
 use tiny_http::{Request, Response, Server};

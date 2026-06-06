@@ -2,7 +2,7 @@ use libstrophe::{
     ConnectClientError, Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult,
     Stanza,
 };
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use nanoid::nanoid;
 use std::{
     sync::{
@@ -133,7 +133,7 @@ impl App {
         room_manager: Rooms,
         tx: Sender<Stanza>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
-        move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
+        move |_ctx, _conn, stanza| {
             debug!("iq stanza received: {}", stanza.to_string());
             let mut iq = Iq::new(stanza);
 
@@ -158,7 +158,7 @@ impl App {
         tx: Sender<Stanza>,
         webrtc: Arc<Webrtc>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
-        move |_ctx: &Context, _conn: &mut Connection, stanza: &Stanza| {
+        move |_ctx, _conn, stanza| {
             if let Some(p_life_cycle) = ParticipantPresence::from_presence(stanza) {
                 match p_life_cycle {
                     PresenceLifecycle::ParticipantJoined(participant) => {
@@ -185,7 +185,7 @@ impl App {
 
                     PresenceLifecycle::ParticipantLeft(participant) => {
                         let room_name = participant.from.split('@').next().unwrap_or_default();
-                        let rm = room_manager.lock().unwrap();
+                        let mut rm = room_manager.lock().unwrap();
                         rm.on_participant_left(room_name, &participant.endpoint_id);
                         info!("processed participant left for: {room_name} room");
                     }
@@ -194,6 +194,7 @@ impl App {
                         let room_name = participant.from.split('@').next().unwrap_or_default();
                         let rm = room_manager.lock().unwrap();
                         rm.on_meeting_terminated(room_name);
+                        info!("processed meeting terminated for: {room_name} room");
                     }
                 }
             }

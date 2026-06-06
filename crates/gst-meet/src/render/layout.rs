@@ -2,8 +2,8 @@ use gstreamer::{Element, Pad, glib::object::ObjectExt};
 
 pub const SCREEN_W: i32 = 1920;
 pub const SCREEN_H: i32 = 1080;
-pub const SMALL_TILE_W: i32 = 250;
-pub const SMALL_TILE_H: i32 = 250;
+pub const SMALL_TILE_W: i32 = 200;
+pub const SMALL_TILE_H: i32 = 150;
 
 #[derive(Debug, PartialEq, PartialOrd)]
 #[allow(unused)]

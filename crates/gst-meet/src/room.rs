@@ -21,8 +21,14 @@ use webrtc_sdp::{
 };
 
 use crate::{
-    config::Webrtc, get_attribute, iq::Iq, make_stanza, render::renderer_engine::RendererEngine,
-    sdp::Sdp, upgrade_weak, xep::XEP,
+    config::Webrtc,
+    get_attribute,
+    iq::Iq,
+    make_stanza,
+    render::{renderer_engine::RendererEngine, renderer_handle::RendererHandle},
+    sdp::Sdp,
+    upgrade_weak,
+    xep::XEP,
 };
 
 use thiserror::Error;
@@ -63,7 +69,7 @@ pub struct RoomInner {
     tx: Sender<Stanza>,
     ufrag: OnceLock<String>,
     pwd: OnceLock<String>,
-    renderer: RendererEngine,
+    renderer_handler: RendererHandle,
 }
 
 #[derive(Debug)]
@@ -190,7 +196,7 @@ impl Room {
             compositor: compositor.clone(),
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),
-            renderer: RendererEngine::new(pipeline, compositor),
+            renderer_handler: RendererEngine::spawn(pipeline, compositor),
         }));
 
         let room_clone = room.downgrade();
@@ -377,7 +383,7 @@ impl Room {
 
         let ssrc = structure.get::<u32>("ssrc").unwrap_or(0);
 
-        let endpoint_id = match self.renderer.endpoint_for_ssrc(ssrc) {
+        let endpoint_id = match self.renderer_handler.endpoint_for_ssrc(ssrc) {
             Some(id) => id,
             None => {
                 info!("no endpoint for ssrc {}, ignoring", ssrc);
@@ -385,11 +391,11 @@ impl Room {
             }
         };
 
-        let is_screenshare = self.renderer.is_screenshare_ssrc(ssrc);
+        let is_screenshare = self.renderer_handler.is_screenshare_ssrc(ssrc);
 
         let compositor_sink_pad = match self
-            .renderer
-            .on_video_stream_arrived(&endpoint_id, is_screenshare)
+            .renderer_handler
+            .video_stream_arrived(&endpoint_id, is_screenshare)
         {
             Some(pad) => pad,
             None => {
@@ -580,18 +586,18 @@ impl Room {
     }
 
     pub fn on_participant_joined(
-        &self,
+        &mut self,
         endpoint_id: &str,
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
     ) {
-        self.renderer
-            .on_participant_joined(endpoint_id, nickname, video_muted, audio_muted);
+        self.renderer_handler
+            .participant_joined(endpoint_id, nickname, video_muted, audio_muted);
     }
 
-    pub fn on_participant_left(&self, endpoint_id: &str) {
-        self.renderer.on_participant_left(endpoint_id);
+    pub fn on_participant_left(&mut self, endpoint_id: &str) {
+        self.renderer_handler.participant_left(endpoint_id);
     }
 
     pub fn on_meeting_terminated(&self) {
@@ -610,7 +616,8 @@ impl Room {
         info!("pipeline stopped, file finalized for room: {}", self.name);
     }
 
-    pub fn handle_register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
-        self.renderer.register_ssrc(ssrc, endpoint_id, source_name);
+    pub fn handle_register_ssrc(&mut self, ssrc: u32, endpoint_id: &str, source_name: &str) {
+        self.renderer_handler
+            .register_ssrc(ssrc, endpoint_id, source_name);
     }
 }
