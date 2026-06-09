@@ -114,6 +114,7 @@ impl Room {
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
         let muxer = ElementFactory::make("matroskamux").build()?;
         let filesink = ElementFactory::make("filesink").build()?;
+        let videorate = ElementFactory::make("videorate").build()?;
 
         let output_location = format!("{}.mkv", name);
 
@@ -133,13 +134,21 @@ impl Room {
         pipeline.add_many([
             &webrtcbin,
             &compositor,
+            &videorate,
             &videoconvert,
             &encoder,
             &muxer,
             &filesink,
         ])?;
 
-        Element::link_many([&compositor, &videoconvert, &encoder, &muxer, &filesink])?;
+        Element::link_many([
+            &compositor,
+            &videorate,
+            &videoconvert,
+            &encoder,
+            &muxer,
+            &filesink,
+        ])?;
 
         let room_name_clone = name.clone();
         pipeline.call_async(move |pipeline| match pipeline.set_state(State::Playing) {
@@ -563,9 +572,15 @@ impl Room {
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
+        screenshare_muted: bool,
     ) {
-        self.renderer_handler
-            .participant_joined(endpoint_id, nickname, video_muted, audio_muted);
+        self.renderer_handler.participant_joined(
+            endpoint_id,
+            nickname,
+            video_muted,
+            audio_muted,
+            screenshare_muted,
+        );
     }
 
     pub fn source_info_updated(
@@ -573,13 +588,13 @@ impl Room {
         endpoint_id: &str,
         video_muted: bool,
         audio_muted: bool,
-        has_screenshare: bool,
+        screenshare_muted: bool,
     ) {
         self.renderer_handler.source_info_updated(
             endpoint_id,
             video_muted,
             audio_muted,
-            has_screenshare,
+            screenshare_muted,
         );
     }
 

@@ -2,7 +2,7 @@ use libstrophe::{
     ConnectClientError, Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult,
     Stanza,
 };
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use nanoid::nanoid;
 use std::{
     sync::{

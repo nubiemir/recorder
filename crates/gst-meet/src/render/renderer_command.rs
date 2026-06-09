@@ -8,6 +8,7 @@ pub enum RendererCommand {
         nickname: String,
         video_muted: bool,
         audio_muted: bool,
+        screenshare_muted: bool,
     },
     ParticipantLeft {
         endpoint_id: String,
@@ -16,7 +17,7 @@ pub enum RendererCommand {
         endpoint_id: String,
         video_muted: bool,
         audio_muted: bool,
-        has_screenshare: bool,
+        screenshare_muted: bool,
     },
     RegisterSsrc {
         ssrc: u32,

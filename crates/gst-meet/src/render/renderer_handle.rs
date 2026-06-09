@@ -16,12 +16,14 @@ impl RendererHandle {
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
+        screenshare_muted: bool,
     ) {
         let _ = self.tx.send(RendererCommand::ParticipantJoined {
             endpoint_id: endpoint_id.to_string(),
             nickname: nickname.to_string(),
             video_muted,
             audio_muted,
+            screenshare_muted,
         });
     }
 
@@ -36,13 +38,13 @@ impl RendererHandle {
         endpoint_id: &str,
         video_muted: bool,
         audio_muted: bool,
-        has_screenshare: bool,
+        screenshare_muted: bool,
     ) {
         let _ = self.tx.send(RendererCommand::SourceInfoUpdated {
             endpoint_id: endpoint_id.to_string(),
             video_muted,
             audio_muted,
-            has_screenshare,
+            screenshare_muted,
         });
     }
 

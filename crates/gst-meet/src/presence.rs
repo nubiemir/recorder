@@ -18,7 +18,7 @@ pub struct ParticipantPresence {
     pub real_jid: Option<String>,
     pub video_muted: bool,
     pub audio_muted: bool,
-    pub is_screen_share: bool,
+    pub screenshare_muted: bool,
     pub from: String,
 }
 
@@ -42,7 +42,7 @@ impl ParticipantPresence {
             Some(real_jid)
         };
 
-        let (video_muted, audio_muted, is_screen_share) =
+        let (video_muted, audio_muted, screenshare_muted) =
             Self::parse_source_info(stanza, &endpoint_id);
 
         let mut participant = Self {
@@ -52,7 +52,7 @@ impl ParticipantPresence {
             from: presence_stanza.from,
             video_muted,
             audio_muted,
-            is_screen_share,
+            screenshare_muted,
         };
 
         if presence_stanza.kind.is_empty() {
@@ -91,7 +91,11 @@ impl ParticipantPresence {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let is_screen_share = map.contains_key(&screen_key);
+        let screenshare_muted = map
+            .get(&screen_key)
+            .and_then(|v| v.get("muted"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let audio_muted = map
             .get(&audio_key)
@@ -99,6 +103,6 @@ impl ParticipantPresence {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        (video_muted, audio_muted, is_screen_share)
+        (video_muted, audio_muted, screenshare_muted)
     }
 }

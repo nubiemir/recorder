@@ -9,7 +9,7 @@ use gstreamer::{
     prelude::{ElementExt, ElementExtManual, GstBinExt, GstBinExtManual, PadExt},
 };
 
-use log::{error, info, warn};
+use log::{error, info};
 
 use crate::render::{
     layout::{LayoutEngine, Tile, TileContent},
@@ -57,8 +57,15 @@ impl RendererEngine {
                     nickname,
                     video_muted,
                     audio_muted,
+                    screenshare_muted,
                 } => {
-                    self.on_participant_joined(&endpoint_id, &nickname, video_muted, audio_muted);
+                    self.on_participant_joined(
+                        &endpoint_id,
+                        &nickname,
+                        video_muted,
+                        audio_muted,
+                        screenshare_muted,
+                    );
                 }
 
                 RendererCommand::ParticipantLeft { endpoint_id } => {
@@ -69,13 +76,13 @@ impl RendererEngine {
                     endpoint_id,
                     video_muted,
                     audio_muted,
-                    has_screenshare,
+                    screenshare_muted,
                 } => {
                     self.on_source_info_updated(
                         &endpoint_id,
                         video_muted,
                         audio_muted,
-                        has_screenshare,
+                        screenshare_muted,
                     );
                 }
 
@@ -126,6 +133,7 @@ impl RendererEngine {
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
+        screenshare_muted: bool,
     ) {
         if self.tiles.contains_key(endpoint_id) {
             return;
@@ -135,7 +143,13 @@ impl RendererEngine {
             endpoint_id, nickname
         );
 
-        if let Err(e) = self.add_black_tile_for(endpoint_id, nickname, video_muted, audio_muted) {
+        if let Err(e) = self.add_black_tile_for(
+            endpoint_id,
+            nickname,
+            video_muted,
+            audio_muted,
+            screenshare_muted,
+        ) {
             error!("failed to add black tile for {}: {:?}", endpoint_id, e);
             return;
         }
@@ -160,7 +174,7 @@ impl RendererEngine {
         endpoint_id: &str,
         video_muted: bool,
         audio_muted: bool,
-        has_screenshare: bool,
+        screenshare_muted: bool,
     ) {
         let tile = match self.tiles.get_mut(endpoint_id) {
             Some(t) => t,
@@ -173,7 +187,7 @@ impl RendererEngine {
         let prev_video_muted = tile.video_muted;
         tile.video_muted = video_muted;
         tile.audio_muted = audio_muted;
-        tile.has_screenshare = has_screenshare;
+        tile.screenshare_muted = screenshare_muted;
 
         if !prev_video_muted && video_muted && tile.content == TileContent::Camera {
             info!("camera off for {}, switching to black tile", endpoint_id);
@@ -284,6 +298,7 @@ impl RendererEngine {
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
+        screenshare_muted: bool,
     ) -> Result<(), BoolError> {
         let src = ElementFactory::make("videotestsrc")
             .property_from_str("pattern", "black")
@@ -361,6 +376,7 @@ impl RendererEngine {
                     nickname.to_string(),
                     video_muted,
                     audio_muted,
+                    screenshare_muted,
                 )
             });
 
@@ -464,7 +480,7 @@ impl RendererEngine {
 
         if let Some(tile) = self.tiles.get_mut(endpoint_id) {
             tile.screenshare_compositor_pad = Some(pad.clone());
-            tile.has_screenshare = true;
+            tile.screenshare_muted = false;
         }
 
         self.recalculate_layout();
@@ -476,7 +492,7 @@ impl RendererEngine {
             if let Some(pad) = tile.screenshare_compositor_pad.take() {
                 self.compositor.release_request_pad(&pad);
             }
-            tile.has_screenshare = false;
+            tile.screenshare_muted = true;
         }
     }
 
@@ -513,14 +529,12 @@ impl RendererEngine {
     }
 
     fn recalculate_layout(&self) {
-        let tile = self.tiles.values();
-        warn!("tile: {:?}", tile);
         let tile_info: Vec<(&String, bool, bool)> = self
             .tiles
             .iter()
             .map(|(ep, t)| {
                 let is_dom = self.dominant_speaker.as_deref() == Some(ep.as_str());
-                (ep, t.has_screenshare, is_dom)
+                (ep, !t.screenshare_muted, is_dom)
             })
             .collect();
 
@@ -537,7 +551,16 @@ impl RendererEngine {
                     }
                 })
             },
-            |ep| self.tiles.get(ep).and_then(|t| t.large_pad.clone()),
+            |ep| {
+                // large pad: if screensharing use screenshare pad, else use large_pad
+                self.tiles.get(ep).and_then(|t| {
+                    if !t.screenshare_muted {
+                        t.screenshare_compositor_pad.clone()
+                    } else {
+                        t.large_pad.clone()
+                    }
+                })
+            },
         );
     }
 }

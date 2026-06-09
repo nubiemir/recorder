@@ -52,6 +52,7 @@ impl RoomManager {
                 &participant.display_name.unwrap_or_default(),
                 participant.video_muted,
                 participant.audio_muted,
+                participant.screenshare_muted,
             );
             self.insert(room);
             return Ok(());
@@ -62,7 +63,7 @@ impl RoomManager {
                 &participant.endpoint_id,
                 participant.video_muted,
                 participant.audio_muted,
-                participant.is_screen_share,
+                participant.screenshare_muted,
             );
         }
         Ok(())
