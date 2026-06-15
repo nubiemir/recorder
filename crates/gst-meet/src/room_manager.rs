@@ -38,6 +38,12 @@ impl RoomManager {
         self.rooms.contains_key(name)
     }
 
+    pub fn on_meeting_started(&self, name: &str) {
+        if let Some(room) = self.get(name) {
+            room.on_meeting_started();
+        }
+    }
+
     pub fn on_participant_joined(
         &mut self,
         name: &str,

@@ -1,37 +1,57 @@
-use std::{
-    process::exit,
-    sync::{Arc, OnceLock, Weak, mpsc::Sender},
+use crate::{
+    config::Webrtc,
+    get_attribute,
+    iq::Iq,
+    make_stanza,
+    sdp::Sdp,
+    timeline::{timeline_engine::TimelineEngine, timeline_handler::TimelineHandler},
+    upgrade_weak,
+    xep::XEP,
 };
-
 use gstreamer::{
     Element, ElementFactory, Pad, PadDirection, PadLinkError, Pipeline, Promise, PromiseError,
     State, StateChangeError, Structure, StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
-    prelude::{ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExtManual, PadExt},
+    prelude::{
+        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, PadExt,
+    },
 };
 use gstreamer_sdp::SDPMessage;
 use gstreamer_webrtc::{WebRTCDataChannel, WebRTCSessionDescription};
 use libstrophe::Stanza;
-use log::{error, info};
+use log::{error, info, warn};
 use nanoid::nanoid;
+use serde::Deserialize;
+use std::{
+    collections::HashMap,
+    fs::DirBuilder,
+    process::exit,
+    sync::{Arc, Mutex, OnceLock, Weak, mpsc::Sender},
+};
+use thiserror::Error;
 use webrtc_sdp::{
     SdpType,
     attribute_type::{SdpAttribute, parse_attribute},
     parse_sdp,
 };
 
-use crate::{
-    config::Webrtc,
-    get_attribute,
-    iq::Iq,
-    make_stanza,
-    render::{renderer_engine::RendererEngine, renderer_handle::RendererHandle},
-    sdp::Sdp,
-    upgrade_weak,
-    xep::XEP,
-};
+#[derive(Deserialize)]
+#[serde(tag = "colibriClass")]
+#[allow(unused)]
+enum ColibriMessage {
+    #[serde(rename = "DominantSpeakerEndpointChangeEvent")]
+    DominantSpeakerEndpointChange {
+        #[serde(rename = "dominantSpeakerEndpoint")]
+        dominant_speaker_endpoint: String,
+        #[serde(rename = "previousSpeakers", default)]
+        previous_speakers: Vec<String>,
+        #[serde(default)]
+        silence: bool,
+    },
 
-use thiserror::Error;
+    #[serde(other)]
+    Unknown,
+}
 
 #[derive(Debug, Error)]
 pub enum IncomingStreamError {
@@ -58,18 +78,23 @@ pub enum IncomingStreamError {
 }
 
 #[derive(Debug)]
+struct Media {
+    audio_muted: bool,
+    video_muted: bool,
+    screenshare_muted: bool,
+}
+
+#[derive(Debug)]
 #[allow(unused)]
 pub struct RoomInner {
     name: String,
     webrtcbin: Element,
     pipeline: Pipeline,
-    muxer: Element,
-    compositor: Element,
-    filesink: Element,
     tx: Sender<Stanza>,
     ufrag: OnceLock<String>,
     pwd: OnceLock<String>,
-    renderer_handler: RendererHandle,
+    timeline_handler: TimelineHandler,
+    participant_media: Mutex<HashMap<String, Media>>,
 }
 
 #[derive(Debug)]
@@ -112,43 +137,20 @@ impl Room {
     pub fn new(name: String, tx: Sender<Stanza>, webrtc: &Webrtc) -> Result<Self, BoolError> {
         let pipeline = Pipeline::new();
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
-        let muxer = ElementFactory::make("matroskamux").build()?;
-        let filesink = ElementFactory::make("filesink").build()?;
-        let videorate = ElementFactory::make("videorate").build()?;
 
-        let output_location = format!("{}.mkv", name);
+        let output_path = format!("recordings/{}", name);
 
-        filesink.set_property("location", output_location);
+        match DirBuilder::new().recursive(true).create(&output_path) {
+            Err(err) => {
+                error!("failed to create directory for: {name} err: {err:?} room");
+            }
+            _ => {}
+        }
 
         webrtcbin.set_property_from_str("stun-server", &webrtc.stun_server);
         webrtcbin.set_property_from_str("bundle-policy", &webrtc.bundle_policy);
 
-        let compositor = ElementFactory::make("compositor").build()?;
-
-        let videoconvert = ElementFactory::make("videoconvert").build()?;
-
-        let encoder = ElementFactory::make("x264enc")
-            .property_from_str("tune", "zerolatency")
-            .build()?;
-
-        pipeline.add_many([
-            &webrtcbin,
-            &compositor,
-            &videorate,
-            &videoconvert,
-            &encoder,
-            &muxer,
-            &filesink,
-        ])?;
-
-        Element::link_many([
-            &compositor,
-            &videorate,
-            &videoconvert,
-            &encoder,
-            &muxer,
-            &filesink,
-        ])?;
+        pipeline.add_many([&webrtcbin])?;
 
         let room_name_clone = name.clone();
         pipeline.call_async(move |pipeline| match pipeline.set_state(State::Playing) {
@@ -168,16 +170,15 @@ impl Room {
         });
 
         let room = Room(Arc::new(RoomInner {
-            name,
+            name: name.clone(),
             webrtcbin,
             pipeline: pipeline.clone(),
             tx,
-            filesink,
-            muxer,
-            compositor: compositor.clone(),
+            participant_media: Mutex::new(HashMap::new()),
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),
-            renderer_handler: RendererEngine::spawn(pipeline, compositor),
+            timeline_handler: TimelineEngine::new(name.to_string(), output_path.to_string())
+                .spawn(),
         }));
 
         let room_clone = room.downgrade();
@@ -187,6 +188,144 @@ impl Room {
         });
 
         Ok(room)
+    }
+
+    pub fn on_incoming_stream(&self, pad: &Pad) -> Result<(), IncomingStreamError> {
+        if pad.direction() != PadDirection::Src {
+            return Ok(());
+        }
+
+        let caps = pad
+            .current_caps()
+            .or_else(|| Some(pad.query_caps(None)))
+            .ok_or(IncomingStreamError::MissingCaps)?;
+        let structure = caps
+            .structure(0)
+            .ok_or(IncomingStreamError::MissingStructure)?;
+
+        if !structure.name().starts_with("application/x-rtp") {
+            return Ok(());
+        }
+
+        let ssrc = structure.get::<u32>("ssrc").unwrap_or(0);
+        let encoding = structure.get::<String>("encoding-name").unwrap_or_default();
+
+        let queue = ElementFactory::make("queue").build()?;
+
+        let (depay, parse) = match encoding.as_str() {
+            "AV1" => (
+                ElementFactory::make("rtpav1depay").build()?,
+                Some(ElementFactory::make("av1parse").build()?),
+            ),
+            "VP8" => (ElementFactory::make("rtpvp8depay").build()?, None),
+            "VP9" => (ElementFactory::make("rtpvp9depay").build()?, None),
+            "H264" => (
+                ElementFactory::make("rtph264depay").build()?,
+                Some(ElementFactory::make("h264parse").build()?),
+            ),
+            "OPUS" => (ElementFactory::make("rtpopusdepay").build()?, None),
+            other => {
+                warn!("unsupported encoding {} for ssrc {}", other, ssrc);
+                return Ok(());
+            }
+        };
+
+        let muxer = ElementFactory::make("matroskamux")
+            .property("streamable", true)
+            .build()?;
+
+        let filesink = ElementFactory::make("filesink").build()?;
+        let path = format!("{}/{}.mkv", self.name, ssrc);
+        filesink.set_property("location", &path);
+
+        self.pipeline
+            .add_many([&queue, &depay, &muxer, &filesink])?;
+        if let Some(parse) = &parse {
+            self.pipeline.add(parse)?;
+            Element::link_many([&queue, &depay, parse, &muxer])?;
+        } else {
+            Element::link_many([&queue, &depay, &muxer])?;
+        }
+        Element::link(&muxer, &filesink)?;
+
+        pad.link(
+            &queue
+                .static_pad("sink")
+                .ok_or(IncomingStreamError::MissingQueueSinkPad)?,
+        )?;
+
+        queue.sync_state_with_parent()?;
+        depay.sync_state_with_parent()?;
+        if let Some(parse) = &parse {
+            parse.sync_state_with_parent()?;
+        }
+        muxer.sync_state_with_parent()?;
+        filesink.sync_state_with_parent()?;
+
+        info!("recording {} → {}", ssrc, path);
+        Ok(())
+    }
+
+    fn on_data_channel(&self, dc: WebRTCDataChannel) {
+        let room_name = self.name.clone();
+        dc.connect_on_open(move |data_channel| {
+            info!(
+                "JVB confirmed DataChannel open for:{} room. Sending constraints...",
+                room_name
+            );
+
+            let colibri_message = r#"{"colibriClass":"ReceiverVideoConstraints","lastN":-1,"defaultConstraints":{"maxHeight":720}}"#;
+
+
+            match data_channel.send_string_full(Some(colibri_message)) {
+                Ok(_) => info!(
+                    "colibri constraints sent successfully for: {} room",
+                    room_name
+                ),
+                Err(err) => error!(
+                    "failed to send colibri message for: {} room, err: {:?}",
+                    room_name, err
+                ),
+            }
+        });
+
+        let room_name = self.name.clone();
+        let room_clone = self.downgrade();
+        dc.connect_on_message_string(move |_dc, data| match data {
+            Some(data) => {
+                info!(
+                    "data channel on message for: {} room, data: {:?}",
+                    room_name, data
+                );
+
+                let room = upgrade_weak!(room_clone);
+
+                let msg: ColibriMessage = match serde_json::from_str(data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("failed to parse colibri message: {e}; raw: {data:?}");
+                        return;
+                    }
+                };
+
+                match msg {
+                    ColibriMessage::DominantSpeakerEndpointChange {
+                        dominant_speaker_endpoint,
+                        ..
+                    } => {
+                        room.timeline_handler
+                            .dominant_change(Some(dominant_speaker_endpoint));
+                    }
+                    _ => {}
+                }
+            }
+            None => {}
+        });
+
+        let room_name = self.name.clone();
+        dc.connect_on_error(move |_dc, err| {
+            error!("data channel error for: {} room, err: {:?}", room_name, err);
+        });
     }
 
     pub fn handle_ice_candidate(&mut self, from: &str, to: &str, sid: &str, initiator: &str) {
@@ -297,131 +436,6 @@ impl Room {
         None
     }
 
-    fn on_data_channel(&self, dc: WebRTCDataChannel) {
-        let room_name = self.name.clone();
-        dc.connect_on_open(move |data_channel| {
-            info!(
-                "JVB confirmed DataChannel open for:{} room. Sending constraints...",
-                room_name
-            );
-
-            let colibri_message = r#"{"colibriClass":"ReceiverVideoConstraints","lastN":-1,"defaultConstraints":{"maxHeight":720}}"#;
-
-
-            match data_channel.send_string_full(Some(colibri_message)) {
-                Ok(_) => info!(
-                    "colibri constraints sent successfully for: {} room",
-                    room_name
-                ),
-                Err(err) => error!(
-                    "failed to send colibri message for: {} room, err: {:?}",
-                    room_name, err
-                ),
-            }
-        });
-
-        let room_name = self.name.clone();
-        dc.connect_on_message_string(move |_dc, data| match data {
-            Some(data) => {
-                info!(
-                    "data channel on message for: {} room, data: {:?}",
-                    room_name, data
-                );
-            }
-            None => {}
-        });
-
-        let room_name = self.name.clone();
-        dc.connect_on_error(move |_dc, err| {
-            error!("data channel error for: {} room, err: {:?}", room_name, err);
-        });
-    }
-
-    pub fn on_incoming_stream(&self, pad: &Pad) -> Result<(), IncomingStreamError> {
-        if pad.direction() != PadDirection::Src {
-            return Ok(());
-        }
-
-        let caps = pad
-            .current_caps()
-            .or_else(|| Some(pad.query_caps(None)))
-            .ok_or(IncomingStreamError::MissingCaps)?;
-
-        let structure = caps
-            .structure(0)
-            .ok_or(IncomingStreamError::MissingStructure)?;
-
-        if !structure.name().starts_with("application/x-rtp") {
-            return Ok(());
-        }
-
-        let encoding_name = structure.get::<String>("encoding-name").unwrap_or_default();
-
-        if encoding_name != "AV1" {
-            info!("skipping non-AV1 stream: {}", encoding_name);
-            return Ok(());
-        }
-
-        let ssrc = structure.get::<u32>("ssrc").unwrap_or(0);
-
-        let endpoint_id = match self.renderer_handler.endpoint_for_ssrc(ssrc) {
-            Some(id) => id,
-            None => {
-                info!("no endpoint for ssrc {}, ignoring", ssrc);
-                return Ok(());
-            }
-        };
-
-        let is_screenshare = self.renderer_handler.is_screenshare_ssrc(ssrc);
-
-        let compositor_sink_pad = match self
-            .renderer_handler
-            .video_stream_arrived(&endpoint_id, is_screenshare)
-        {
-            Some(pad) => pad,
-            None => {
-                error!(
-                    "renderer could not provide compositor pad for {}",
-                    endpoint_id
-                );
-                return Ok(());
-            }
-        };
-
-        let queue = ElementFactory::make("queue").build()?;
-        let depay = ElementFactory::make("rtpav1depay").build()?;
-        let parser = ElementFactory::make("av1parse").build()?;
-        let decoder = ElementFactory::make("dav1ddec").build()?;
-        let convert = ElementFactory::make("videoconvert").build()?;
-
-        self.pipeline
-            .add_many([&queue, &depay, &parser, &decoder, &convert])?;
-        Element::link_many([&queue, &depay, &parser, &decoder, &convert])?;
-
-        let queue_sink_pad = queue
-            .static_pad("sink")
-            .ok_or(IncomingStreamError::MissingQueueSinkPad)?;
-
-        pad.link(&queue_sink_pad)?;
-
-        convert
-            .static_pad("src")
-            .unwrap()
-            .link(&compositor_sink_pad)?;
-
-        queue.sync_state_with_parent()?;
-        depay.sync_state_with_parent()?;
-        parser.sync_state_with_parent()?;
-        decoder.sync_state_with_parent()?;
-        convert.sync_state_with_parent()?;
-
-        info!(
-            "stream linked for endpoint={} screenshare={}",
-            endpoint_id, is_screenshare
-        );
-
-        Ok(())
-    }
     fn on_answer_created(
         &self,
         from: String,
@@ -566,6 +580,10 @@ impl Room {
         });
     }
 
+    pub fn on_meeting_started(&self) {
+        self.timeline_handler.meeting_started();
+    }
+
     pub fn on_participant_joined(
         &mut self,
         endpoint_id: &str,
@@ -574,13 +592,30 @@ impl Room {
         audio_muted: bool,
         screenshare_muted: bool,
     ) {
-        self.renderer_handler.participant_joined(
-            endpoint_id,
-            nickname,
+        let mut par_media = self.participant_media.lock().unwrap();
+
+        par_media.insert(
+            endpoint_id.to_string(),
+            Media {
+                audio_muted,
+                video_muted,
+                screenshare_muted,
+            },
+        );
+
+        self.timeline_handler.participant_joined(
+            Some(endpoint_id.to_string()),
+            nickname.to_string(),
             video_muted,
             audio_muted,
-            screenshare_muted,
         );
+        // self.renderer_handler.participant_joined(
+        //     endpoint_id,
+        //     nickname,
+        //     video_muted,
+        //     audio_muted,
+        //     screenshare_muted,
+        // );
     }
 
     pub fn source_info_updated(
@@ -590,36 +625,83 @@ impl Room {
         audio_muted: bool,
         screenshare_muted: bool,
     ) {
-        self.renderer_handler.source_info_updated(
-            endpoint_id,
-            video_muted,
-            audio_muted,
-            screenshare_muted,
+        let mut par_media = self.participant_media.lock().unwrap();
+        let participant = par_media.get(endpoint_id);
+
+        if let Some(participant) = participant {
+            if participant.video_muted != video_muted {
+                if participant.video_muted {
+                    self.timeline_handler
+                        .camera_on(Some(endpoint_id.to_string()));
+                } else {
+                    self.timeline_handler
+                        .camera_off(Some(endpoint_id.to_string()));
+                }
+            }
+
+            if participant.audio_muted != audio_muted {
+                if participant.audio_muted {
+                    self.timeline_handler
+                        .audio_on(Some(endpoint_id.to_string()));
+                } else {
+                    self.timeline_handler
+                        .audio_off(Some(endpoint_id.to_string()));
+                }
+            }
+
+            if participant.screenshare_muted != screenshare_muted {
+                if participant.screenshare_muted {
+                    self.timeline_handler
+                        .screenshare_on(Some(endpoint_id.to_string()));
+                } else {
+                    self.timeline_handler
+                        .screenshare_off(Some(endpoint_id.to_string()));
+                }
+            }
+        }
+
+        par_media.insert(
+            endpoint_id.to_string(),
+            Media {
+                audio_muted,
+                video_muted,
+                screenshare_muted,
+            },
         );
+
+        // self.renderer_handler.source_info_updated(
+        //     endpoint_id,
+        //     video_muted,
+        //     audio_muted,
+        //     screenshare_muted,
+        // );
     }
 
     pub fn on_participant_left(&mut self, endpoint_id: &str) {
-        self.renderer_handler.participant_left(endpoint_id);
+        self.timeline_handler
+            .participant_left(Some(endpoint_id.to_string()));
+        // self.renderer_handler.participant_left(endpoint_id);
     }
 
     pub fn on_meeting_terminated(&self) {
-        if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
-            error!("failed to send EOS for room: {}", self.name);
-        }
-
-        if let Some(bus) = self.pipeline.bus() {
-            let _ = bus.timed_pop_filtered(
-                gstreamer::ClockTime::from_seconds(5),
-                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
-            );
-        }
-
-        let _ = self.pipeline.set_state(State::Null);
-        info!("pipeline stopped, file finalized for room: {}", self.name);
+        self.timeline_handler.meeting_ended();
+        // if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
+        //     error!("failed to send EOS for room: {}", self.name);
+        // }
+        //
+        // if let Some(bus) = self.pipeline.bus() {
+        //     let _ = bus.timed_pop_filtered(
+        //         gstreamer::ClockTime::from_seconds(5),
+        //         &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        //     );
+        // }
+        //
+        // let _ = self.pipeline.set_state(State::Null);
+        // info!("pipeline stopped, file finalized for room: {}", self.name);
     }
 
-    pub fn handle_register_ssrc(&mut self, ssrc: u32, endpoint_id: &str, source_name: &str) {
-        self.renderer_handler
-            .register_ssrc(ssrc, endpoint_id, source_name);
+    pub fn handle_register_ssrc(&mut self, _ssrc: u32, _endpoint_id: &str, _source_name: &str) {
+        // self.renderer_handler
+        //     .register_ssrc(ssrc, endpoint_id, source_name);
     }
 }
