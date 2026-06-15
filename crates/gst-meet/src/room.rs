@@ -246,7 +246,7 @@ impl Room {
         };
 
         let media_prefix = if is_screenshare {
-            "is_screenshare"
+            "screenshare"
         } else if is_audio {
             "audio"
         } else {
@@ -300,7 +300,13 @@ impl Room {
         }
         Element::link(&muxer, &filesink)?;
 
-        // FIX 1: Synchronize State changes BEFORE linking to the live streaming pad
+        // Link the webrtcbin src pad into the branch. (This was missing.)
+        let qsink = queue
+            .static_pad("sink")
+            .ok_or(IncomingStreamError::MissingQueueSinkPad)?;
+        pad.link(&qsink)?;
+
+        // Bring the new branch up to the pipeline's running state.
         queue.sync_state_with_parent()?;
         depay.sync_state_with_parent()?;
         if let Some(parse) = &parse {
@@ -308,6 +314,8 @@ impl Room {
         }
         muxer.sync_state_with_parent()?;
         filesink.sync_state_with_parent()?;
+
+        info!("recording {} (ssrc={}) -> {}", encoding, ssrc, path);
 
         Ok(())
     }

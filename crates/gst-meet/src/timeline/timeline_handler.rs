@@ -1,4 +1,3 @@
-use log::error;
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -203,14 +202,6 @@ impl TimelineHandler {
             .insert(ssrc, (endpoint_id.to_string(), is_screenshare, is_audio));
     }
 
-<<<<<<< HEAD
-=======
-    pub fn printout(&self) {
-        let ssrc_map = self.ssrc_map.lock().unwrap();
-        error!("ssrc_map: {:?}", ssrc_map);
-    }
-
->>>>>>> 22da2cd502ab09519f587700931944b42d3ef299
     pub fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<String> {
         self.ssrc_map
             .lock()
