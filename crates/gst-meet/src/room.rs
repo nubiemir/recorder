@@ -300,13 +300,7 @@ impl Room {
         }
         Element::link(&muxer, &filesink)?;
 
-        // Link webrtcbin src pad into the branch.
-        let qsink = queue
-            .static_pad("sink")
-            .ok_or(IncomingStreamError::MissingQueueSinkPad)?;
-        pad.link(&qsink)?;
-
-        // Bring the branch up to the pipeline state.
+        // FIX 1: Synchronize State changes BEFORE linking to the live streaming pad
         queue.sync_state_with_parent()?;
         depay.sync_state_with_parent()?;
         if let Some(parse) = &parse {
@@ -314,8 +308,6 @@ impl Room {
         }
         muxer.sync_state_with_parent()?;
         filesink.sync_state_with_parent()?;
-
-        info!("recording {} (ssrc={}) -> {}", encoding, ssrc, path);
 
         Ok(())
     }
