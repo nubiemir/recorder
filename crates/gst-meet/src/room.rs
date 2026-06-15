@@ -13,7 +13,8 @@ use gstreamer::{
     State, StateChangeError, Structure, StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
     prelude::{
-        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, PadExt,
+        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
+        GstObjectExt, PadExt,
     },
 };
 use gstreamer_sdp::SDPMessage;
@@ -169,6 +170,14 @@ impl Room {
             }
         });
 
+        let timeline_engine = TimelineEngine::new(output_path.to_string());
+        let timeline_handler = TimelineEngine::spawn(
+            timeline_engine.output_path,
+            name.clone(),
+            timeline_engine.start_instant,
+            timeline_engine.start_timestamp,
+        );
+
         let room = Room(Arc::new(RoomInner {
             name: name.clone(),
             webrtcbin,
@@ -177,14 +186,15 @@ impl Room {
             participant_media: Mutex::new(HashMap::new()),
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),
-            timeline_handler: TimelineEngine::new(name.to_string(), output_path.to_string())
-                .spawn(),
+            timeline_handler: timeline_handler,
         }));
 
         let room_clone = room.downgrade();
         room.webrtcbin.connect_pad_added(move |_webrtc, pad| {
             let room = upgrade_weak!(room_clone);
-            let _ = room.on_incoming_stream(pad);
+            if let Err(e) = room.on_incoming_stream(pad) {
+                error!("on_incoming_stream failed: {e:?}");
+            }
         });
 
         Ok(room)
@@ -199,6 +209,7 @@ impl Room {
             .current_caps()
             .or_else(|| Some(pad.query_caps(None)))
             .ok_or(IncomingStreamError::MissingCaps)?;
+
         let structure = caps
             .structure(0)
             .ok_or(IncomingStreamError::MissingStructure)?;
@@ -210,34 +221,75 @@ impl Room {
         let ssrc = structure.get::<u32>("ssrc").unwrap_or(0);
         let encoding = structure.get::<String>("encoding-name").unwrap_or_default();
 
-        let queue = ElementFactory::make("queue").build()?;
+        let endpoint = match self.timeline_handler.endpoint_for_ssrc(ssrc) {
+            Some(e) => e,
+            None => {
+                warn!(
+                    "no endpoint mapping for ssrc={} (pad {}), skipping",
+                    ssrc,
+                    pad.name()
+                );
+                return Ok(());
+            }
+        };
 
-        let (depay, parse) = match encoding.as_str() {
-            "AV1" => (
-                ElementFactory::make("rtpav1depay").build()?,
-                Some(ElementFactory::make("av1parse").build()?),
-            ),
-            "VP8" => (ElementFactory::make("rtpvp8depay").build()?, None),
-            "VP9" => (ElementFactory::make("rtpvp9depay").build()?, None),
-            "H264" => (
-                ElementFactory::make("rtph264depay").build()?,
-                Some(ElementFactory::make("h264parse").build()?),
-            ),
-            "OPUS" => (ElementFactory::make("rtpopusdepay").build()?, None),
+        let is_audio = self.timeline_handler.is_audio_ssrc(ssrc);
+        let is_screenshare = self.timeline_handler.is_screenshare_ssrc(ssrc);
+
+        let is_video = match encoding.as_str() {
+            "VP8" | "VP9" | "H264" | "AV1" => true,
+            "OPUS" => false,
             other => {
                 warn!("unsupported encoding {} for ssrc {}", other, ssrc);
                 return Ok(());
             }
         };
 
-        let muxer = ElementFactory::make("matroskamux")
-            .property("streamable", true)
-            .build()?;
+        let media_prefix = if is_screenshare {
+            "is_screenshare"
+        } else if is_audio {
+            "audio"
+        } else {
+            "video"
+        };
+
+        let queue = ElementFactory::make("queue").build()?;
+
+        let depay = match encoding.as_str() {
+            "AV1" => ElementFactory::make("rtpav1depay").build()?,
+            "VP8" => ElementFactory::make("rtpvp8depay").build()?,
+            "VP9" => ElementFactory::make("rtpvp9depay").build()?,
+            "H264" => ElementFactory::make("rtph264depay").build()?,
+            "OPUS" => ElementFactory::make("rtpopusdepay").build()?,
+            _ => unreachable!(),
+        };
+
+        // Parsers needed to produce muxer-acceptable framing/alignment.
+        // AV1: av1parse converts OBU-alignment -> TU-alignment that matroskamux wants.
+        // H264: h264parse for AVC framing. OPUS: opusparse for Ogg.
+        // VP8/VP9: matroskamux accepts depayloader output directly.
+        let parse = match encoding.as_str() {
+            "AV1" => Some(ElementFactory::make("av1parse").build()?),
+            "H264" => Some(ElementFactory::make("h264parse").build()?),
+            "OPUS" => Some(ElementFactory::make("opusparse").build()?),
+            _ => None,
+        };
+
+        // matroskamux for video (AV1/VP8/VP9/H264), oggmux for audio.
+        let (muxer, ext) = if is_video {
+            (ElementFactory::make("matroskamux").build()?, "mkv")
+        } else {
+            (ElementFactory::make("oggmux").build()?, "ogg")
+        };
 
         let filesink = ElementFactory::make("filesink").build()?;
-        let path = format!("{}/{}.mkv", self.name, ssrc);
+        let path = format!(
+            "recordings/{}/{}/{}.{}",
+            self.name, endpoint, media_prefix, ext
+        );
         filesink.set_property("location", &path);
 
+        // Add and link: queue -> depay -> [parse] -> muxer -> filesink
         self.pipeline
             .add_many([&queue, &depay, &muxer, &filesink])?;
         if let Some(parse) = &parse {
@@ -248,12 +300,13 @@ impl Room {
         }
         Element::link(&muxer, &filesink)?;
 
-        pad.link(
-            &queue
-                .static_pad("sink")
-                .ok_or(IncomingStreamError::MissingQueueSinkPad)?,
-        )?;
+        // Link webrtcbin src pad into the branch.
+        let qsink = queue
+            .static_pad("sink")
+            .ok_or(IncomingStreamError::MissingQueueSinkPad)?;
+        pad.link(&qsink)?;
 
+        // Bring the branch up to the pipeline state.
         queue.sync_state_with_parent()?;
         depay.sync_state_with_parent()?;
         if let Some(parse) = &parse {
@@ -262,7 +315,8 @@ impl Room {
         muxer.sync_state_with_parent()?;
         filesink.sync_state_with_parent()?;
 
-        info!("recording {} → {}", ssrc, path);
+        info!("recording {} (ssrc={}) -> {}", encoding, ssrc, path);
+
         Ok(())
     }
 
@@ -685,23 +739,35 @@ impl Room {
 
     pub fn on_meeting_terminated(&self) {
         self.timeline_handler.meeting_ended();
-        // if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
-        //     error!("failed to send EOS for room: {}", self.name);
-        // }
-        //
-        // if let Some(bus) = self.pipeline.bus() {
-        //     let _ = bus.timed_pop_filtered(
-        //         gstreamer::ClockTime::from_seconds(5),
-        //         &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
-        //     );
-        // }
-        //
-        // let _ = self.pipeline.set_state(State::Null);
-        // info!("pipeline stopped, file finalized for room: {}", self.name);
+
+        if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
+            error!("failed to send EOS for room: {}", self.name);
+        }
+
+        if let Some(bus) = self.pipeline.bus() {
+            let _ = bus.timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(5),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            );
+        }
+
+        let _ = self.pipeline.set_state(State::Null);
+        info!("pipeline stopped, file finalized for room: {}", self.name);
     }
 
-    pub fn handle_register_ssrc(&mut self, _ssrc: u32, _endpoint_id: &str, _source_name: &str) {
-        // self.renderer_handler
-        //     .register_ssrc(ssrc, endpoint_id, source_name);
+    pub fn handle_register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
+        self.timeline_handler
+            .register_ssrc(ssrc, endpoint_id, source_name);
+        let output_path = format!("recordings/{}/{}", self.name, endpoint_id);
+
+        match DirBuilder::new().recursive(true).create(&output_path) {
+            Err(err) => {
+                error!(
+                    "failed to create directory for: {} err: {err:?}",
+                    output_path
+                );
+            }
+            _ => {}
+        }
     }
 }

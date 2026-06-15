@@ -1,5 +1,11 @@
+use log::error;
 use serde::Serialize;
-use std::{fmt::Display, sync::mpsc::Sender, time::Instant};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    sync::{Mutex, mpsc::Sender},
+    time::Instant,
+};
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "eventType")]
@@ -73,6 +79,7 @@ impl Display for TimelineEvent {
 pub(crate) struct TimelineHandler {
     tx: Sender<TimelineEvent>,
     start_instant: Instant,
+    pub ssrc_map: Mutex<HashMap<u32, (String, bool, bool)>>,
 }
 
 impl TimelineHandler {
@@ -80,6 +87,7 @@ impl TimelineHandler {
         Self {
             tx,
             start_instant: instant,
+            ssrc_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -184,5 +192,40 @@ impl TimelineHandler {
             timestamp_ms: self.get_relative_ms(),
             endpoint: None,
         });
+    }
+
+    pub fn register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
+        let is_screenshare = source_name.ends_with("-v1");
+        let is_audio = source_name.ends_with("-a0");
+        self.ssrc_map
+            .lock()
+            .unwrap()
+            .insert(ssrc, (endpoint_id.to_string(), is_screenshare, is_audio));
+    }
+
+    pub fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<String> {
+        self.ssrc_map
+            .lock()
+            .unwrap()
+            .get(&ssrc)
+            .map(|(ep, _, _)| ep.clone())
+    }
+
+    pub fn is_screenshare_ssrc(&self, ssrc: u32) -> bool {
+        self.ssrc_map
+            .lock()
+            .unwrap()
+            .get(&ssrc)
+            .map(|(_, is_share, _)| *is_share)
+            .unwrap_or(false)
+    }
+
+    pub fn is_audio_ssrc(&self, ssrc: u32) -> bool {
+        self.ssrc_map
+            .lock()
+            .unwrap()
+            .get(&ssrc)
+            .map(|(_, _, is_audio)| *is_audio)
+            .unwrap_or(false)
     }
 }
