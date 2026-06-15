@@ -15,7 +15,6 @@ use crate::timeline::{
 
 pub struct TimelineEngine {
     pub output_path: String,
-    pub room: String,
     pub start_instant: Instant,
     pub start_timestamp: u128,
 }
@@ -28,29 +27,27 @@ fn now_unix() -> u128 {
 }
 
 impl TimelineEngine {
-    pub fn new(room: String, output_path: String) -> Self {
+    pub fn new(output_path: String) -> Self {
         Self {
-            room,
             output_path,
             start_instant: Instant::now(),
             start_timestamp: now_unix(),
         }
     }
 
-    pub fn spawn(self) -> TimelineHandler {
+    pub fn spawn(
+        output_path: String,
+        room: String,
+        start_instant: Instant,
+        start_timestamp: u128,
+    ) -> TimelineHandler {
         let (tx, rx) = mpsc::channel();
 
         std::thread::spawn(move || {
-            Self::run(
-                rx,
-                self.output_path,
-                self.room,
-                self.start_instant,
-                self.start_timestamp,
-            );
+            Self::run(rx, output_path, room, start_instant, start_timestamp);
         });
 
-        TimelineHandler::new(tx, self.start_instant)
+        TimelineHandler::new(tx, start_instant)
     }
     fn run(
         rx: Receiver<TimelineEvent>,

@@ -13,7 +13,8 @@ use gstreamer::{
     State, StateChangeError, Structure, StructureRef,
     glib::{BoolError, Value, object::ObjectExt},
     prelude::{
-        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, PadExt,
+        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
+        GstObjectExt, PadExt,
     },
 };
 use gstreamer_sdp::SDPMessage;
@@ -169,6 +170,14 @@ impl Room {
             }
         });
 
+        let timeline_engine = TimelineEngine::new(output_path.to_string());
+        let timeline_handler = TimelineEngine::spawn(
+            timeline_engine.output_path,
+            name.clone(),
+            timeline_engine.start_instant,
+            timeline_engine.start_timestamp,
+        );
+
         let room = Room(Arc::new(RoomInner {
             name: name.clone(),
             webrtcbin,
@@ -177,8 +186,7 @@ impl Room {
             participant_media: Mutex::new(HashMap::new()),
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),
-            timeline_handler: TimelineEngine::new(name.to_string(), output_path.to_string())
-                .spawn(),
+            timeline_handler: timeline_handler,
         }));
 
         let room_clone = room.downgrade();
@@ -199,6 +207,7 @@ impl Room {
             .current_caps()
             .or_else(|| Some(pad.query_caps(None)))
             .ok_or(IncomingStreamError::MissingCaps)?;
+
         let structure = caps
             .structure(0)
             .ok_or(IncomingStreamError::MissingStructure)?;
@@ -209,6 +218,23 @@ impl Room {
 
         let ssrc = structure.get::<u32>("ssrc").unwrap_or(0);
         let encoding = structure.get::<String>("encoding-name").unwrap_or_default();
+
+        let is_audio = self.timeline_handler.is_audio_ssrc(ssrc);
+        let is_screenshare = self.timeline_handler.is_screenshare_ssrc(ssrc);
+
+        error!("ssrc: {}", ssrc);
+        self.timeline_handler.printout();
+
+        let endpoint = self.timeline_handler.endpoint_for_ssrc(ssrc).unwrap();
+
+        let is_video = match encoding.as_str() {
+            "VP8" | "VP9" | "H264" | "AV1" => true,
+            "OPUS" => false,
+            other => {
+                warn!("Unsupported encoding {} for ssrc {}", other, ssrc);
+                return Ok(());
+            }
+        };
 
         let queue = ElementFactory::make("queue").build()?;
 
@@ -224,20 +250,36 @@ impl Room {
                 Some(ElementFactory::make("h264parse").build()?),
             ),
             "OPUS" => (ElementFactory::make("rtpopusdepay").build()?, None),
-            other => {
-                warn!("unsupported encoding {} for ssrc {}", other, ssrc);
-                return Ok(());
-            }
+            _ => unreachable!(),
         };
 
-        let muxer = ElementFactory::make("matroskamux")
-            .property("streamable", true)
-            .build()?;
+        // Select appropriate lightweight container muxer depending on track type
+        let (muxer, file_extension) = if is_video {
+            let m = ElementFactory::make("webmmux").build()?;
+            // Forces continuous file structure writing, minimizing corruption risk
+            m.set_property("streamable", true);
+            (m, "webm")
+        } else {
+            (ElementFactory::make("oggmux").build()?, "ogg")
+        };
 
         let filesink = ElementFactory::make("filesink").build()?;
-        let path = format!("{}/{}.mkv", self.name, ssrc);
+
+        let media_prefix = if is_audio {
+            "audio"
+        } else if is_screenshare {
+            "screenshare"
+        } else {
+            "video"
+        };
+
+        let path = format!(
+            "recordings/{}/{}/{}.{}",
+            self.name, endpoint, media_prefix, file_extension
+        );
         filesink.set_property("location", &path);
 
+        // Assemble and Link Elements
         self.pipeline
             .add_many([&queue, &depay, &muxer, &filesink])?;
         if let Some(parse) = &parse {
@@ -248,12 +290,7 @@ impl Room {
         }
         Element::link(&muxer, &filesink)?;
 
-        pad.link(
-            &queue
-                .static_pad("sink")
-                .ok_or(IncomingStreamError::MissingQueueSinkPad)?,
-        )?;
-
+        // FIX 1: Synchronize State changes BEFORE linking to the live streaming pad
         queue.sync_state_with_parent()?;
         depay.sync_state_with_parent()?;
         if let Some(parse) = &parse {
@@ -262,7 +299,15 @@ impl Room {
         muxer.sync_state_with_parent()?;
         filesink.sync_state_with_parent()?;
 
-        info!("recording {} → {}", ssrc, path);
+        // FIX 1 (cont.): Safely link the dynamic pad now that downstream elements are awake
+        pad.link(
+            &queue
+                .static_pad("sink")
+                .ok_or(IncomingStreamError::MissingQueueSinkPad)?,
+        )?;
+
+        info!("Recording {} stream (SSRC: {}) -> {}", encoding, ssrc, path);
+
         Ok(())
     }
 
@@ -685,23 +730,50 @@ impl Room {
 
     pub fn on_meeting_terminated(&self) {
         self.timeline_handler.meeting_ended();
-        // if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
-        //     error!("failed to send EOS for room: {}", self.name);
-        // }
-        //
-        // if let Some(bus) = self.pipeline.bus() {
-        //     let _ = bus.timed_pop_filtered(
-        //         gstreamer::ClockTime::from_seconds(5),
-        //         &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
-        //     );
-        // }
-        //
-        // let _ = self.pipeline.set_state(State::Null);
-        // info!("pipeline stopped, file finalized for room: {}", self.name);
+
+        // FIX 2: Iterate through all elements in the pipeline, find the entry "queue" elements,
+        // and push EOS directly to them so it passes forward through the muxers.
+        let _ = self.pipeline.iterate_elements().foreach(|element| {
+            if element
+                .factory()
+                .map(|f| f.name() == "queue")
+                .unwrap_or(false)
+            {
+                if !element.send_event(gstreamer::event::Eos::new()) {
+                    warn!(
+                        "Failed to send EOS to recording stream queue: {:?}",
+                        element.name()
+                    );
+                }
+            }
+        });
+
+        // Wait for the EOS messages to flow through the muxers, flush to filesink, and bubble back to the bus
+        if let Some(bus) = self.pipeline.bus() {
+            let _ = bus.timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(5),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            );
+        }
+
+        let _ = self.pipeline.set_state(State::Null);
+        info!("pipeline stopped, file finalized for room: {}", self.name);
     }
 
-    pub fn handle_register_ssrc(&mut self, _ssrc: u32, _endpoint_id: &str, _source_name: &str) {
-        // self.renderer_handler
-        //     .register_ssrc(ssrc, endpoint_id, source_name);
+    pub fn handle_register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
+        error!("ssrc:{} | endpoint: {}", ssrc, endpoint_id);
+        self.timeline_handler
+            .register_ssrc(ssrc, endpoint_id, source_name);
+        let output_path = format!("recordings/{}/{}", self.name, endpoint_id);
+
+        match DirBuilder::new().recursive(true).create(&output_path) {
+            Err(err) => {
+                error!(
+                    "failed to create directory for: {} err: {err:?}",
+                    output_path
+                );
+            }
+            _ => {}
+        }
     }
 }

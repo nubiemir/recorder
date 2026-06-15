@@ -87,39 +87,43 @@ impl<'a> JingleAction<'a> {
         };
 
         for (endpoint_id, data) in sources {
+            // RTX ssrcs only come from the video groups in data[1]
+            let empty = vec![];
             let rtx_ssrcs: std::collections::HashSet<u32> = data[1]
                 .as_array()
-                .unwrap_or(&vec![])
+                .unwrap_or(&empty)
                 .iter()
                 .filter_map(|g| g.as_array())
                 .filter(|g| g.first().and_then(|v| v.as_str()) == Some("f"))
                 .filter_map(|g| g.get(2).and_then(|v| v.as_u64()).map(|v| v as u32))
                 .collect();
 
-            let media_sources = match data[0].as_array() {
-                Some(s) => s,
-                None => continue,
-            };
-
-            for source in media_sources {
-                let ssrc = match source["s"].as_u64() {
-                    Some(s) => s as u32,
+            // data[0] = video sources, data[2] = audio sources
+            for (idx, label) in [(0usize, "video"), (2usize, "audio")] {
+                let media_sources = match data[idx].as_array() {
+                    Some(s) => s,
                     None => continue,
                 };
 
-                let source_name = source["n"].as_str().unwrap_or("");
+                for source in media_sources {
+                    let ssrc = match source["s"].as_u64() {
+                        Some(s) => s as u32,
+                        None => continue,
+                    };
+                    let source_name = source["n"].as_str().unwrap_or("");
 
-                if rtx_ssrcs.contains(&ssrc) {
-                    info!("source-add: skipping RTX ssrc={}", ssrc);
-                    continue;
+                    // RTX filtering only meaningful for video; rtx_ssrcs is empty for audio
+                    if rtx_ssrcs.contains(&ssrc) {
+                        info!("source-add: skipping RTX ssrc={}", ssrc);
+                        continue;
+                    }
+
+                    info!(
+                        "source-add: registering {} ssrc={} endpoint={} source={}",
+                        label, ssrc, endpoint_id, source_name
+                    );
+                    res.push((ssrc, endpoint_id.to_string(), source_name.to_string()));
                 }
-
-                info!(
-                    "source-add: registering ssrc={} endpoint={} source={}",
-                    ssrc, endpoint_id, source_name
-                );
-
-                res.push((ssrc, endpoint_id.to_string(), source_name.to_string()));
             }
         }
 
