@@ -45,13 +45,18 @@ fn main() {
                     match App::handle_join_room(&tx, &room) {
                         Ok(room_name) => {
                             info!("sent presence for: {room_name} room");
-                            let response = Response::from_string(
-                                format!("successfully joined room: {}", room_name).to_string(),
-                            );
+
+                            // Explicitly build a structured 200 OK response
+                            let message = format!("successfully joined room: {}", room_name);
+                            let response = Response::from_string(message).with_status_code(200); // Forces standard HTTP compliance
+
                             let _ = request.respond(response);
                         }
                         Err(err) => {
                             error!("failed to send presence for: {err:?} room");
+                            let response = Response::from_string(format!("Error: {:?}", err))
+                                .with_status_code(500);
+                            let _ = request.respond(response);
                         }
                     }
                 });
@@ -89,10 +94,14 @@ fn init_config() -> Result<ConfigSettings, ConfigError> {
     Ok(settings)
 }
 
-fn parse_room(request: &Request, config: &Arc<ConfigSettings>) -> String {
-    let room = request
-        .url()
-        .trim_start_matches(config.server.start_pattern_trim.as_str());
+fn parse_room(request: &Request, _config: &Arc<ConfigSettings>) -> String {
+    let url = request.url();
 
-    room.to_string()
+    if let Some(pos) = url.find("room=") {
+        let query_value = &url[pos + 5..];
+        let room_name = query_value.split('&').next().unwrap_or(query_value);
+        return room_name.to_string();
+    }
+
+    "unknown_room".to_string()
 }

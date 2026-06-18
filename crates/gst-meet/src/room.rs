@@ -9,9 +9,9 @@ use crate::{
     xep::XEP,
 };
 use gstreamer::{
-    Element, ElementFactory, Pad, PadDirection, PadLinkError, Pipeline, Promise, PromiseError,
-    State, StateChangeError, Structure, StructureRef,
-    glib::{BoolError, Value, object::ObjectExt},
+    Element, ElementFactory, MessageView, Pad, PadDirection, PadLinkError, Pipeline, Promise,
+    PromiseError, State, StateChangeError, Structure, StructureRef,
+    glib::{BoolError, ControlFlow, MainLoop, Value, object::ObjectExt},
     prelude::{
         ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
         GstObjectExt, PadExt,
@@ -28,6 +28,7 @@ use std::{
     fs::DirBuilder,
     process::exit,
     sync::{Arc, Mutex, OnceLock, Weak, mpsc::Sender},
+    thread,
 };
 use thiserror::Error;
 use webrtc_sdp::{
@@ -188,6 +189,13 @@ impl Room {
             pwd: OnceLock::new(),
             timeline_handler: timeline_handler,
         }));
+        let main_loop = MainLoop::new(None, false);
+        let ml_for_watch = main_loop.clone();
+
+        room.bus_handler(ml_for_watch);
+        thread::spawn(move || {
+            main_loop.run();
+        });
 
         let room_clone = room.downgrade();
         room.webrtcbin.connect_pad_added(move |_webrtc, pad| {
@@ -277,7 +285,13 @@ impl Room {
 
         // matroskamux for video (AV1/VP8/VP9/H264), oggmux for audio.
         let (muxer, ext) = if is_video {
-            (ElementFactory::make("matroskamux").build()?, "mkv")
+            (
+                ElementFactory::make("matroskamux")
+                    .property("offset-to-zero", true)
+                    .property("streamable", false)
+                    .build()?,
+                "mkv",
+            )
         } else {
             (ElementFactory::make("oggmux").build()?, "ogg")
         };
@@ -414,6 +428,39 @@ impl Room {
 
     pub fn get_pipeline(&self) -> &Pipeline {
         &self.pipeline
+    }
+
+    fn bus_handler(&self, main_loop: MainLoop) {
+        let bus = match self.pipeline.bus() {
+            Some(bus) => bus,
+            None => {
+                return warn!("couldn't create bus handler for: {} room", self.name);
+            }
+        };
+
+        let room_clone = self.downgrade();
+        let _ = bus.add_watch(move |_, msg| match msg.view() {
+            MessageView::Eos(_eos) => {
+                warn!("End of stream reached. Finalizing pipeline state cleanly.");
+                let room = upgrade_weak!(room_clone, ControlFlow::Break);
+                let _ = room.pipeline.set_state(State::Null);
+                info!("pipeline stopped, files finalized for room: {}", room.name);
+                main_loop.quit();
+                ControlFlow::Break
+            }
+            MessageView::Error(err) => {
+                error!(
+                    "Error from elements {}: {} (debug: {:?}",
+                    err.src()
+                        .map(|s| s.path_string())
+                        .unwrap_or_else(|| "Unknown".into()),
+                    err.error(),
+                    err.debug()
+                );
+                ControlFlow::Break
+            }
+            _ => ControlFlow::Continue,
+        });
     }
 
     fn on_ice_candidate(
@@ -738,21 +785,14 @@ impl Room {
     }
 
     pub fn on_meeting_terminated(&self) {
-        self.timeline_handler.meeting_ended();
+        // let room_clone = self.downgrade();
+        // self.pipeline.call_async(move |pipeline| {
+        //     let room = upgrade_weak!(room_clone);
+        //     let _ = pipeline.set_state(State::Null);
+        //     room.timeline_handler.meeting_ended();
+        // });
 
-        if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
-            error!("failed to send EOS for room: {}", self.name);
-        }
-
-        if let Some(bus) = self.pipeline.bus() {
-            let _ = bus.timed_pop_filtered(
-                gstreamer::ClockTime::from_seconds(5),
-                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
-            );
-        }
-
-        let _ = self.pipeline.set_state(State::Null);
-        info!("pipeline stopped, file finalized for room: {}", self.name);
+        self.shutdown();
     }
 
     pub fn handle_register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
@@ -768,6 +808,14 @@ impl Room {
                 );
             }
             _ => {}
+        }
+    }
+
+    fn shutdown(&self) {
+        self.timeline_handler.meeting_ended();
+
+        if !self.pipeline.send_event(gstreamer::event::Eos::new()) {
+            error!("failed to send EOS for room: {}", self.name);
         }
     }
 }

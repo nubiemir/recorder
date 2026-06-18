@@ -81,9 +81,9 @@ impl RoomManager {
         }
     }
 
-    pub fn on_meeting_terminated(&self, name: &str) {
-        if let Some(room) = self.get(name) {
-            room.on_meeting_terminated();
-        }
+    pub fn on_meeting_terminated(&mut self, name: &str) {
+        // if let Some(room) = self.rooms.remove(name) {
+        self.get_mut(name).unwrap().on_meeting_terminated();
+        // }
     }
 }

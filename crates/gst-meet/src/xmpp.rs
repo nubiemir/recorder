@@ -194,7 +194,7 @@ impl App {
 
                     PresenceLifecycle::MeetingTerminated(participant) => {
                         let room_name = participant.from.split('@').next().unwrap_or_default();
-                        let rm = room_manager.lock().unwrap();
+                        let mut rm = room_manager.lock().unwrap();
                         rm.on_meeting_terminated(room_name);
                         info!("processed meeting terminated for: {room_name} room");
                     }
