@@ -7,7 +7,7 @@ use std::{
     io,
 };
 
-pub fn read_file(path: &str) -> Timeline {
+pub fn _read_file(path: &str) -> Timeline {
     let file = File::open(path).unwrap();
     let timeline: Timeline = serde_json::from_reader(file).unwrap();
     timeline

@@ -1,3 +1,4 @@
+use log::{info, warn};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -5,6 +6,8 @@ use std::{
     sync::{Mutex, mpsc::Sender},
     time::Instant,
 };
+
+use crate::iq::jingle_action::ParsedSource;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "eventType")]
@@ -74,11 +77,34 @@ impl Display for TimelineEvent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceKind {
+    CameraVideo,
+    Audio,
+    ScreenshareVideo,
+}
+
+impl Display for SourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CameraVideo => write!(f, "camera_video"),
+            Self::Audio => write!(f, "audio"),
+            Self::ScreenshareVideo => write!(f, "screenshare_video"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceEntry {
+    pub endpoint: String,
+    pub kind: SourceKind,
+}
+
 #[derive(Debug)]
 pub(crate) struct TimelineHandler {
     tx: Sender<TimelineEvent>,
     start_instant: Instant,
-    pub ssrc_map: Mutex<HashMap<u32, (String, bool, bool)>>,
+    pub ssrc_map: Mutex<HashMap<u32, SourceEntry>>,
 }
 
 impl TimelineHandler {
@@ -193,38 +219,73 @@ impl TimelineHandler {
         });
     }
 
-    pub fn register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
-        let is_screenshare = source_name.ends_with("-v1");
-        let is_audio = source_name.ends_with("-a0");
-        self.ssrc_map
-            .lock()
-            .unwrap()
-            .insert(ssrc, (endpoint_id.to_string(), is_screenshare, is_audio));
+    /// "c8ef68f5-v1" -> ('v', 1), "eee01355-a0" -> ('a', 0)
+    fn parse_source_name(&self, name: &str) -> Option<(char, u32)> {
+        let suffix = name.rsplit('-').next()?; // "v1"
+        let mut chars = suffix.chars();
+        let letter = chars.next()?; // 'v' or 'a'
+        let idx: u32 = chars.as_str().parse().ok()?; // 0, 1, ...
+        Some((letter, idx))
     }
 
-    pub fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<String> {
-        self.ssrc_map
-            .lock()
-            .unwrap()
-            .get(&ssrc)
-            .map(|(ep, _, _)| ep.clone())
+    pub fn register_ssrc(&self, parsed_source: ParsedSource) {
+        let (letter, index) = match self.parse_source_name(&parsed_source.source_name) {
+            Some(v) => v,
+            None => {
+                warn!(
+                    "register_ssrc: unparseable source name {}, skipping",
+                    parsed_source.source_name
+                );
+                return;
+            }
+        };
+
+        let kind = match letter {
+            'v' => {
+                if parsed_source.video_type == Some("d".to_string()) {
+                    SourceKind::ScreenshareVideo
+                } else {
+                    SourceKind::CameraVideo
+                }
+            }
+            'a' => SourceKind::Audio,
+            _ => {
+                warn!("unexpected source letter in {}", parsed_source.source_name);
+                return;
+            }
+        };
+
+        info!(
+            "register_ssrc: ssrc={} endpoint={} name={} index={} kind={:?}",
+            parsed_source.ssrc, parsed_source.endpoint_id, parsed_source.source_name, index, kind
+        );
+
+        self.ssrc_map.lock().unwrap().insert(
+            parsed_source.ssrc,
+            SourceEntry {
+                endpoint: parsed_source.endpoint_id,
+                kind,
+            },
+        );
     }
 
-    pub fn is_screenshare_ssrc(&self, ssrc: u32) -> bool {
-        self.ssrc_map
-            .lock()
-            .unwrap()
-            .get(&ssrc)
-            .map(|(_, is_share, _)| *is_share)
-            .unwrap_or(false)
+    pub fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<SourceEntry> {
+        self.ssrc_map.lock().unwrap().get(&ssrc).cloned()
     }
-
-    pub fn is_audio_ssrc(&self, ssrc: u32) -> bool {
-        self.ssrc_map
-            .lock()
-            .unwrap()
-            .get(&ssrc)
-            .map(|(_, _, is_audio)| *is_audio)
-            .unwrap_or(false)
-    }
+    // pub fn is_audio_ssrc(&self, ssrc: u32) -> bool {
+    //     self.ssrc_map
+    //         .lock()
+    //         .unwrap()
+    //         .get(&ssrc)
+    //         .map(|e| e.kind)
+    //         .unwrap_or(false)
+    // }
+    // pub fn is_screenshare_ssrc(&self, ssrc: u32) -> bool {
+    //     self.ssrc_map
+    //         .lock()
+    //         .unwrap()
+    //         .get(&ssrc)
+    //         .map(|e| e.is_screenshare)
+    //         .unwrap_or(false)
+    // }
 }

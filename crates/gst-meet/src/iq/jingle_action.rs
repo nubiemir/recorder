@@ -24,6 +24,13 @@ pub enum JingleAction<'a> {
     SourceRemove(&'a Stanza),
 }
 
+pub struct ParsedSource {
+    pub ssrc: u32,
+    pub endpoint_id: String,
+    pub source_name: String,
+    pub video_type: Option<String>, // Some("d") => screenshare video; None for audio/camera
+}
+
 impl<'a> JingleAction<'a> {
     pub(crate) fn parse(s: &str, stanza: &'a Stanza) -> Option<Self> {
         match s {
@@ -59,17 +66,16 @@ impl<'a> JingleAction<'a> {
         final_sdp
     }
 
-    pub fn handle_source_add(&self, stanza: &Stanza) -> Vec<(u32, String, String)> {
+    pub fn handle_source_add(&self, stanza: &Stanza) -> Vec<ParsedSource> {
         let mut res = vec![];
-        let json_raw =
-            match find_first(Some(&stanza), "json-message").and_then(|stanza| stanza.text()) {
-                Some(text) => text,
-                None => {
-                    error!("unable to find source add json message");
-                    return res;
-                }
-            };
 
+        let json_raw = match find_first(Some(&stanza), "json-message").and_then(|s| s.text()) {
+            Some(text) => text,
+            None => {
+                error!("unable to find source add json message");
+                return res;
+            }
+        };
         let json: serde_json::Value = match serde_json::from_str(&json_raw) {
             Ok(v) => v,
             Err(e) => {
@@ -77,7 +83,6 @@ impl<'a> JingleAction<'a> {
                 return res;
             }
         };
-
         let sources = match json["sources"].as_object() {
             Some(s) => s,
             None => {
@@ -87,7 +92,7 @@ impl<'a> JingleAction<'a> {
         };
 
         for (endpoint_id, data) in sources {
-            // RTX ssrcs only come from the video groups in data[1]
+            // RTX ssrcs from FID groups in data[1]; skip them.
             let empty = vec![];
             let rtx_ssrcs: std::collections::HashSet<u32> = data[1]
                 .as_array()
@@ -98,31 +103,36 @@ impl<'a> JingleAction<'a> {
                 .filter_map(|g| g.get(2).and_then(|v| v.as_u64()).map(|v| v as u32))
                 .collect();
 
-            // data[0] = video sources, data[2] = audio sources
-            for (idx, label) in [(0usize, "video"), (2usize, "audio")] {
-                let media_sources = match data[idx].as_array() {
+            // VIDEO (data[0]) before AUDIO (data[2]) so that downstream, audio's
+            // sibling lookup finds the already-registered video at the same index.
+            for arr_idx in [0usize, 2usize] {
+                let media_sources = match data[arr_idx].as_array() {
                     Some(s) => s,
                     None => continue,
                 };
-
                 for source in media_sources {
                     let ssrc = match source["s"].as_u64() {
                         Some(s) => s as u32,
                         None => continue,
                     };
-                    let source_name = source["n"].as_str().unwrap_or("");
-
-                    // RTX filtering only meaningful for video; rtx_ssrcs is empty for audio
                     if rtx_ssrcs.contains(&ssrc) {
                         info!("source-add: skipping RTX ssrc={}", ssrc);
                         continue;
                     }
+                    let source_name = source["n"].as_str().unwrap_or("").to_string();
+                    let video_type = source["v"].as_str().map(|s| s.to_string());
 
                     info!(
-                        "source-add: registering {} ssrc={} endpoint={} source={}",
-                        label, ssrc, endpoint_id, source_name
+                        "source-add: parsed ssrc={} endpoint={} name={} v={:?}",
+                        ssrc, endpoint_id, source_name, video_type
                     );
-                    res.push((ssrc, endpoint_id.to_string(), source_name.to_string()));
+
+                    res.push(ParsedSource {
+                        ssrc,
+                        endpoint_id: endpoint_id.to_string(),
+                        source_name,
+                        video_type,
+                    });
                 }
             }
         }

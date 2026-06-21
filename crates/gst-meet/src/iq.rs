@@ -113,8 +113,8 @@ impl Iq {
                             .get_mut(room_name)
                             .ok_or_else(|| format!("no room found for: {}", room_name))?;
 
-                        for source in sources {
-                            room.handle_register_ssrc(source.0, &source.1, &source.2);
+                        for parsed_source in sources {
+                            room.handle_register_ssrc(parsed_source);
                         }
                         Ok(())
                     })();
