@@ -13,7 +13,7 @@ use gstreamer::{
     State, StateChangeError, Structure, StructureRef,
     glib::{BoolError, MainLoop, Value, object::ObjectExt},
     prelude::{
-        ClockExt, ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
+        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
         GstObjectExt, PadExt, PadExtManual,
     },
 };
@@ -244,10 +244,20 @@ impl Room {
         let endpoint = match self.timeline_handler.endpoint_for_ssrc(ssrc) {
             Some(e) => e,
             None => {
-                warn!(
-                    "no endpoint mapping for ssrc={} (pad {}), skipping",
-                    ssrc,
-                    pad.name()
+                warn!("no endpoint mapping for ssrc={} yet, will retry", ssrc);
+                let room = self.downgrade();
+                let pad = pad.clone();
+                gstreamer::glib::timeout_add_once(
+                    std::time::Duration::from_millis(500),
+                    move || {
+                        let room = match room.upgrade() {
+                            Some(r) => r,
+                            None => return,
+                        };
+                        if let Err(e) = room.on_incoming_stream(&pad) {
+                            error!("retry on_incoming_stream failed: {e:?}");
+                        }
+                    },
                 );
                 return Ok(());
             }
@@ -264,15 +274,6 @@ impl Room {
                 return Ok(());
             }
         }
-
-        let is_video = match encoding.as_str() {
-            "VP8" | "VP9" | "H264" | "AV1" => true,
-            "OPUS" => false,
-            other => {
-                warn!("unsupported encoding {} for ssrc {}", other, ssrc);
-                return Ok(());
-            }
-        };
 
         let queue = ElementFactory::make("queue").build()?;
 
@@ -297,10 +298,14 @@ impl Room {
         };
 
         // matroskamux for video (AV1/VP8/VP9/H264), oggmux for audio.
-        let (muxer, ext) = if is_video {
-            (ElementFactory::make("matroskamux").build()?, "mkv")
-        } else {
-            (ElementFactory::make("oggmux").build()?, "ogg")
+        // offset-to-zero rebases the first buffer's timestamp to 0 so a
+        // late-joining participant's file starts at 00:00 instead of at the
+        // pipeline running-time when they joined.
+        let (muxer, ext) = {
+            let muxer = ElementFactory::make("matroskamux").build()?;
+            muxer.set_property("min-index-interval", 1_000_000_000i64);
+            muxer.set_property("offset-to-zero", true);
+            (muxer, "mkv")
         };
 
         let filesink = ElementFactory::make("filesink").build()?;
@@ -324,13 +329,15 @@ impl Room {
         }
         Element::link(&muxer, &filesink)?;
 
-        // Link the webrtcbin src pad into the branch. (This was missing.)
+        // Link the webrtcbin src pad into the branch.
         let qsink = queue
             .static_pad("sink")
             .ok_or(IncomingStreamError::MissingQueueSinkPad)?;
         pad.link(&qsink)?;
 
         // Bring the new branch up to the pipeline's running state.
+        // Sink-first so the muxer's downstream SEEKABLE query (at start_file)
+        // sees a ready filesink and writes a proper index.
         filesink.sync_state_with_parent()?;
         muxer.sync_state_with_parent()?;
         if let Some(parse) = &parse {
@@ -341,16 +348,15 @@ impl Room {
 
         info!("recording {} (ssrc={}) -> {}", encoding, ssrc, path);
 
-        let key = format!("{}-{}", endpoint.endpoint, endpoint.kind);
         self.branches.lock().unwrap().insert(
             key,
             Branch {
-                queue,
                 src_pad: pad.clone(),
-                depay: depay,
-                muxer: muxer,
-                parse: parse,
-                filesink: filesink,
+                queue,
+                depay,
+                parse,
+                muxer,
+                filesink,
             },
         );
 
@@ -366,7 +372,6 @@ impl Room {
             );
 
             let colibri_message = r#"{"colibriClass":"ReceiverVideoConstraints","lastN":-1,"defaultConstraints":{"maxHeight":720}}"#;
-
 
             match data_channel.send_string_full(Some(colibri_message)) {
                 Ok(_) => info!(
@@ -486,7 +491,7 @@ impl Room {
             let transport = make_stanza!("transport", {
                 "xmlns" => XEP::IceUdpTransport.to_string(),
                 "ufrag" => self.ufrag.get().map(|s| s.as_str()).unwrap_or(""),
-                "pwd" =>self.pwd.get().map(|s| s.as_str()).unwrap_or("") 
+                "pwd" =>self.pwd.get().map(|s| s.as_str()).unwrap_or("")
             }, [candidate_stanza])
             .ok()?;
 
@@ -700,13 +705,6 @@ impl Room {
             video_muted,
             audio_muted,
         );
-        // self.renderer_handler.participant_joined(
-        //     endpoint_id,
-        //     nickname,
-        //     video_muted,
-        //     audio_muted,
-        //     screenshare_muted,
-        // );
     }
 
     pub fn source_info_updated(
@@ -759,13 +757,6 @@ impl Room {
                 screenshare_muted,
             },
         );
-
-        // self.renderer_handler.source_info_updated(
-        //     endpoint_id,
-        //     video_muted,
-        //     audio_muted,
-        //     screenshare_muted,
-        // );
     }
 
     pub fn on_participant_left(&mut self, endpoint_id: &str) {
@@ -783,16 +774,9 @@ impl Room {
         for key in keys {
             self.finalize_branch(&key);
         }
-        // self.renderer_handler.participant_left(endpoint_id);
     }
 
     pub fn on_meeting_terminated(&self) {
-        // let room_clone = self.downgrade();
-        // self.pipeline.call_async(move |pipeline| {
-        //     let room = upgrade_weak!(room_clone);
-        //     let _ = pipeline.set_state(State::Null);
-        //     room.timeline_handler.meeting_ended();
-        // });
         self.pipeline
             .debug_to_dot_file_with_ts(gstreamer::DebugGraphDetails::all(), "shutdown_start");
         self.shutdown();
@@ -841,91 +825,92 @@ impl Room {
         );
 
         src_pad.add_probe(
-        gstreamer::PadProbeType::BLOCK_DOWNSTREAM,
-        move |pad, _info| {
-            info!("[finalize:{}] src pad blocked, unlinking + sending EOS", key);
+            gstreamer::PadProbeType::BLOCK_DOWNSTREAM,
+            move |pad, _info| {
+                info!("[finalize:{}] src pad blocked, unlinking + sending EOS", key);
 
-            // 2. Unlink from the queue and inject EOS into the queue chain.
-            let qsink = match branch.queue.static_pad("sink") {
-                Some(p) => p,
-                None => {
-                    error!("[finalize:{}] queue has no sink pad, aborting", key);
-                    return gstreamer::PadProbeReturn::Remove;
-                }
-            };
-
-            let _ = pad.unlink(&qsink);
-            info!("[finalize:{}] unlinked src pad from queue sink", key);
-
-            let eos_sent = qsink.send_event(gstreamer::event::Eos::new());
-            info!("[finalize:{}] EOS sent into queue chain: {}", key, eos_sent);
-
-            // 3. When EOS reaches the filesink, tear down the branch elements.
-            let fsink_pad = match branch.filesink.static_pad("sink") {
-                Some(p) => p,
-                None => {
-                    error!("[finalize:{}] filesink has no sink pad, aborting", key);
-                    return gstreamer::PadProbeReturn::Remove;
-                }
-            };
-
-            let pipeline = pipeline.clone();
-            let mut elements = vec![
-                branch.queue.clone(),
-                branch.depay.clone(),
-                branch.muxer.clone(),
-                branch.filesink.clone(),
-            ];
-            if let Some(p) = branch.parse.clone() {
-                elements.push(p);
-            }
-            info!(
-                "[finalize:{}] added filesink EOS probe, waiting for EOS to reach filesink ({} elements queued for removal)",
-                key,
-                elements.len()
-            );
-
-            let probe_key = key.clone();
-            fsink_pad.add_probe(
-                gstreamer::PadProbeType::EVENT_DOWNSTREAM,
-                move |_p, info| {
-                    if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
-                        if ev.type_() == gstreamer::EventType::Eos {
-                            info!(
-                                "[finalize:{}] EOS reached filesink — footer written, tearing down branch",
-                                probe_key
-                            );
-                            let elements = elements.clone();
-                            let pipeline = pipeline.clone();
-                            let idle_key = probe_key.clone();
-                            gstreamer::glib::idle_add_once(move || {
-                                for el in &elements {
-                                    let name = el.name();
-                                    let _ = el.set_state(State::Null);
-                                    match pipeline.remove(el) {
-                                        Ok(_) => info!(
-                                            "[finalize:{}] removed element {} from pipeline",
-                                            idle_key, name
-                                        ),
-                                        Err(_) => error!(
-                                            "[finalize:{}] failed to remove element {} from pipeline",
-                                            idle_key, name
-                                        ),
-                                    }
-                                }
-                                info!("[finalize:{}] branch teardown complete", idle_key);
-                            });
-                            return gstreamer::PadProbeReturn::Remove;
-                        }
+                // 2. Unlink from the queue and inject EOS into the queue chain.
+                let qsink = match branch.queue.static_pad("sink") {
+                    Some(p) => p,
+                    None => {
+                        error!("[finalize:{}] queue has no sink pad, aborting", key);
+                        return gstreamer::PadProbeReturn::Remove;
                     }
-                    gstreamer::PadProbeReturn::Ok
-                },
-            );
+                };
 
-            // Remove the block probe — we're done with it.
-            gstreamer::PadProbeReturn::Remove
-        },
-    );
+                let _ = pad.unlink(&qsink);
+                info!("[finalize:{}] unlinked src pad from queue sink", key);
+
+                let eos_sent = qsink.send_event(gstreamer::event::Eos::new());
+                info!("[finalize:{}] EOS sent into queue chain: {}", key, eos_sent);
+
+                // 3. When EOS reaches the filesink, tear down the branch elements.
+                let fsink_pad = match branch.filesink.static_pad("sink") {
+                    Some(p) => p,
+                    None => {
+                        error!("[finalize:{}] filesink has no sink pad, aborting", key);
+                        return gstreamer::PadProbeReturn::Remove;
+                    }
+                };
+
+                let pipeline = pipeline.clone();
+                let mut elements = vec![
+                    branch.queue.clone(),
+                    branch.depay.clone(),
+                    branch.muxer.clone(),
+                    branch.filesink.clone(),
+                ];
+                if let Some(p) = branch.parse.clone() {
+                    elements.push(p);
+                }
+
+                info!(
+                    "[finalize:{}] added filesink EOS probe, waiting for EOS to reach filesink ({} elements queued for removal)",
+                    key,
+                    elements.len()
+                );
+
+                let probe_key = key.clone();
+                fsink_pad.add_probe(
+                    gstreamer::PadProbeType::EVENT_DOWNSTREAM,
+                    move |_p, info| {
+                        if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
+                            if ev.type_() == gstreamer::EventType::Eos {
+                                info!(
+                                    "[finalize:{}] EOS reached filesink — footer written, tearing down branch",
+                                    probe_key
+                                );
+                                let elements = elements.clone();
+                                let pipeline = pipeline.clone();
+                                let idle_key = probe_key.clone();
+                                gstreamer::glib::idle_add_once(move || {
+                                    for el in &elements {
+                                        let name = el.name();
+                                        let _ = el.set_state(State::Null);
+                                        match pipeline.remove(el) {
+                                            Ok(_) => info!(
+                                                "[finalize:{}] removed element {} from pipeline",
+                                                idle_key, name
+                                            ),
+                                            Err(_) => error!(
+                                                "[finalize:{}] failed to remove element {} from pipeline",
+                                                idle_key, name
+                                            ),
+                                        }
+                                    }
+                                    info!("[finalize:{}] branch teardown complete", idle_key);
+                                });
+                                return gstreamer::PadProbeReturn::Remove;
+                            }
+                        }
+                        gstreamer::PadProbeReturn::Ok
+                    },
+                );
+
+                // Remove the block probe — we're done with it.
+                gstreamer::PadProbeReturn::Remove
+            },
+        );
 
         info!(
             "[finalize:{}] block probe installed, returning (finalization continues async)",
@@ -983,7 +968,7 @@ impl Room {
         }
         drop(done_tx);
 
-        // BLOCK until every filesink has seen EOS (footer + Cues fully written).
+        // BLOCK until every filesink has seen EOS (footer + index fully written).
         match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(_) => info!("all branches finalized for room: {}", self.name),
             Err(_) => warn!("finalize wait timed out for room: {}", self.name),
