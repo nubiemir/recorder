@@ -17,7 +17,7 @@ use gstreamer::{
         GstObjectExt, PadExt, PadExtManual,
     },
 };
-use gstreamer_sdp::SDPMessage;
+use gstreamer_sdp::{SDPMessage, SDPMessageRef};
 use gstreamer_webrtc::{WebRTCDataChannel, WebRTCSessionDescription};
 use libstrophe::Stanza;
 use log::{error, info, warn};
@@ -108,6 +108,7 @@ pub struct RoomInner {
     timeline_handler: TimelineHandler,
     participant_media: Mutex<HashMap<String, Media>>,
     branches: Mutex<HashMap<String, Branch>>,
+    pending_pads: Mutex<HashMap<u32, (Pad, gstreamer::PadProbeId)>>,
     main_loop: MainLoop,
 }
 
@@ -154,7 +155,6 @@ impl Room {
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
 
         let output_path = format!("recordings/{}", name);
-
         match DirBuilder::new().recursive(true).create(&output_path) {
             Err(err) => {
                 error!("failed to create directory for: {name} err: {err:?} room");
@@ -183,14 +183,7 @@ impl Room {
                 );
             }
         });
-
-        let timeline_engine = TimelineEngine::new(output_path.to_string());
-        let timeline_handler = TimelineEngine::spawn(
-            timeline_engine.output_path,
-            name.clone(),
-            timeline_engine.start_instant,
-            timeline_engine.start_timestamp,
-        );
+        let timeline_handler = Self::initialize_timeline(&name, &output_path);
 
         let main_loop = MainLoop::new(None, false);
         let room = Room(Arc::new(RoomInner {
@@ -203,6 +196,7 @@ impl Room {
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),
             timeline_handler: timeline_handler,
+            pending_pads: Mutex::new(HashMap::new()),
             main_loop: main_loop.clone(),
         }));
         thread::spawn(move || {
@@ -218,6 +212,16 @@ impl Room {
         });
 
         Ok(room)
+    }
+
+    fn initialize_timeline(room_name: &str, output_path: &str) -> TimelineHandler {
+        let timeline_engine = TimelineEngine::new(output_path.to_string());
+        TimelineEngine::spawn(
+            timeline_engine.output_path,
+            room_name.to_string(),
+            timeline_engine.start_instant,
+            timeline_engine.start_timestamp,
+        )
     }
 
     pub fn on_incoming_stream(&self, pad: &Pad) -> Result<(), IncomingStreamError> {
@@ -244,21 +248,22 @@ impl Room {
         let endpoint = match self.timeline_handler.endpoint_for_ssrc(ssrc) {
             Some(e) => e,
             None => {
-                warn!("no endpoint mapping for ssrc={} yet, will retry", ssrc);
-                let room = self.downgrade();
-                let pad = pad.clone();
-                gstreamer::glib::timeout_add_once(
-                    std::time::Duration::from_millis(500),
-                    move || {
-                        let room = match room.upgrade() {
-                            Some(r) => r,
-                            None => return,
-                        };
-                        if let Err(e) = room.on_incoming_stream(&pad) {
-                            error!("retry on_incoming_stream failed: {e:?}");
-                        }
-                    },
+                warn!(
+                    "no endpoint mapping for ssrc={} yet, parking pad until registered",
+                    ssrc
                 );
+                if let Some(probe_id) = pad
+                    .add_probe(gstreamer::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
+                        gstreamer::PadProbeReturn::Ok
+                    })
+                {
+                    self.pending_pads
+                        .lock()
+                        .unwrap()
+                        .insert(ssrc, (pad.clone(), probe_id));
+                } else {
+                    warn!("couldn't get probe id for ssrc={}", ssrc);
+                }
                 return Ok(());
             }
         };
@@ -587,63 +592,52 @@ impl Room {
         self.webrtcbin
             .emit_by_name::<()>("set-local-description", &[&answer, &None::<Promise>]);
 
-        match answer.sdp().as_text() {
-            Ok(sdp_answer) => match parse_sdp(&sdp_answer, true) {
-                Ok(sdp) => {
-                    let sdp = Sdp::new(&sdp);
+        match self.parse_sdp_answer(answer.sdp(), &to, &from, sid, initiator) {
+            Ok(_) => info!(
+                "successfully sent iq for session accept room: {}",
+                &self.name
+            ),
+            Err(err) => error!(
+                "failed to send session accept iq for room {}: {err:?}",
+                &self.name
+            ),
+        }
+    }
 
-                    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                        for line in sdp_answer.lines() {
-                            if let Some(v) = line.strip_prefix("a=ice-ufrag:") {
-                                if self.ufrag.get().is_none() {
-                                    self.ufrag.set(v.to_string())?;
-                                }
-                            }
-                            if let Some(v) = line.strip_prefix("a=ice-pwd:") {
-                                if self.pwd.get().is_none() {
-                                    self.pwd.set(v.to_string())?;
-                                }
-                            }
-                        }
-
-                        let jingle = sdp.parse_sdp_to_jingle(initiator, sid, &to)?;
-
-                        let iq = make_stanza!("iq", {
-                            "id" => nanoid!(),
-                            "to" => &from,
-                            "from" => &to,
-                            "type" => "set"
-                        }, [jingle])?;
-
-                        self.tx.send(iq)?;
-                        Ok(())
-                    })();
-
-                    match result {
-                        Ok(_) => info!(
-                            "successfully sent iq for session accept room: {}",
-                            &self.name
-                        ),
-                        Err(err) => error!(
-                            "failed to send session accept iq for room {}: {err:?}",
-                            &self.name
-                        ),
-                    }
+    fn parse_sdp_answer(
+        &self,
+        sdp_message: &SDPMessageRef,
+        to: &str,
+        from: &str,
+        sid: &str,
+        initiator: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let sdp_answer = sdp_message.as_text()?;
+        let sdp_session = parse_sdp(&sdp_answer, true)?;
+        let sdp = Sdp::new(&sdp_session);
+        for line in sdp_answer.lines() {
+            if let Some(v) = line.strip_prefix("a=ice-ufrag:") {
+                if self.ufrag.get().is_none() {
+                    self.ufrag.set(v.to_string())?;
                 }
-                Err(err) => {
-                    error!(
-                        "failed to parse to sdp session: {err:?} for room:{}",
-                        &self.name
-                    );
+            }
+            if let Some(v) = line.strip_prefix("a=ice-pwd:") {
+                if self.pwd.get().is_none() {
+                    self.pwd.set(v.to_string())?;
                 }
-            },
-            Err(err) => {
-                error!(
-                    "failed to parse sdp answer: {err:?} for room:{}",
-                    &self.name
-                );
             }
         }
+        let jingle = sdp.parse_sdp_to_jingle(initiator, sid, to)?;
+        let iq = make_stanza!("iq", {
+            "id" => nanoid!(),
+            "to" => from,
+            "from" => to,
+            "type" => "set"
+        }, [jingle])?;
+
+        self.tx.send(iq)?;
+
+        Ok(())
     }
 
     pub fn handle_session_initiate(
@@ -783,6 +777,7 @@ impl Room {
     }
 
     pub fn handle_register_ssrc(&self, parsed_source: ParsedSource) {
+        let ssrc = parsed_source.ssrc;
         let output_path = format!("recordings/{}/{}", self.name, parsed_source.endpoint_id);
         self.timeline_handler.register_ssrc(parsed_source);
 
@@ -794,6 +789,19 @@ impl Room {
                 );
             }
             _ => {}
+        }
+
+        let parked = self.pending_pads.lock().unwrap().remove(&ssrc);
+        if let Some((pad, probe_id)) = parked {
+            info!("registered ssrc={}, processing parked pad", ssrc);
+            let result = self.on_incoming_stream(&pad);
+            pad.remove_probe(probe_id);
+            if let Err(e) = result {
+                error!(
+                    "parked pad on_incoming_stream failed for ssrc={}: {e:?}",
+                    ssrc
+                );
+            }
         }
     }
 
