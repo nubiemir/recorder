@@ -1,4 +1,3 @@
-use gstreamer::glib::BoolError;
 use libstrophe::Stanza;
 
 use crate::{config::Webrtc, presence::ParticipantPresence, room::Room};
@@ -22,9 +21,7 @@ impl RoomManager {
     }
 
     pub fn insert(&mut self, room: Room) {
-        self.rooms
-            .entry(room.get_name().to_string())
-            .or_insert_with(|| room);
+        self.rooms.entry(room.name.clone()).or_insert_with(|| room);
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Room> {
@@ -38,11 +35,11 @@ impl RoomManager {
         self.rooms.contains_key(name)
     }
 
-    pub fn on_meeting_started(&self, name: &str) {
-        if let Some(room) = self.get(name) {
-            room.on_meeting_started();
-        }
-    }
+    // pub fn on_meeting_started(&self, name: &str) {
+    //     if let Some(room) = self.get(name) {
+    //         room.on_meeting_started();
+    //     }
+    // }
 
     pub fn on_participant_joined(
         &mut self,
@@ -50,27 +47,29 @@ impl RoomManager {
         tx: Sender<Stanza>,
         webrtc: &Webrtc,
         participant: ParticipantPresence,
-    ) -> Result<(), BoolError> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if !self.contains_key(name) {
-            let mut room = Room::new(name.to_string(), tx.clone(), &webrtc)?;
-            room.on_participant_joined(
-                &participant.endpoint_id,
-                &participant.display_name.unwrap_or_default(),
-                participant.video_muted,
-                participant.audio_muted,
-                participant.screenshare_muted,
-            );
+            let room = Room::new(name.to_string(), tx.clone(), &webrtc)?;
             self.insert(room);
-            return Ok(());
         }
 
         if let Some(room) = self.get_mut(name) {
-            room.source_info_updated(
-                &participant.endpoint_id,
-                participant.video_muted,
-                participant.audio_muted,
-                participant.screenshare_muted,
-            );
+            if !room.endpoint_available(&participant.endpoint_id) {
+                room.on_participant_joined(
+                    &participant.endpoint_id,
+                    &participant.display_name.unwrap_or_default(),
+                    participant.video_muted,
+                    participant.audio_muted,
+                    participant.screenshare_muted,
+                );
+            } else {
+                room.source_info_updated(
+                    &participant.endpoint_id,
+                    participant.video_muted,
+                    participant.audio_muted,
+                    participant.screenshare_muted,
+                );
+            }
         }
         Ok(())
     }

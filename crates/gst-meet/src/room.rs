@@ -4,14 +4,20 @@ use crate::{
     iq::{Iq, jingle_action::ParsedSource},
     make_stanza,
     sdp::Sdp,
-    timeline::{timeline_engine::TimelineEngine, timeline_handler::TimelineHandler},
+    timeline::{
+        timeline_engine::TimelineEngine,
+        timeline_handler::{SourceEntry, TimelineHandler},
+    },
     upgrade_weak,
     xep::XEP,
 };
 use gstreamer::{
-    Element, ElementFactory, Pad, PadDirection, PadLinkError, Pipeline, Promise, PromiseError,
-    State, StateChangeError, Structure, StructureRef,
-    glib::{BoolError, MainLoop, Value, object::ObjectExt},
+    Bin, Element, ElementFactory, GhostPad, Pad, PadDirection, PadLinkError, Pipeline, Promise,
+    PromiseError, State, StateChangeError, Structure, StructureRef,
+    glib::{
+        BoolError, MainLoop, Value,
+        object::{Cast, ObjectExt},
+    },
     prelude::{
         ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
         GstObjectExt, PadExt, PadExtManual,
@@ -88,18 +94,79 @@ struct Media {
 
 #[derive(Debug)]
 struct Branch {
+    bin: Bin,
     src_pad: Pad,
-    queue: Element,
-    depay: Element,
-    parse: Option<Element>,
-    muxer: Element,
+    entry_pad: Pad,
     filesink: Element,
+}
+
+impl Branch {
+    /// Detach from the upstream pad and push EOS into the branch so the muxer
+    /// writes out its footer/index. Returns whether the EOS was handled.
+    fn drain(&self) -> bool {
+        let _ = self.src_pad.unlink(&self.entry_pad);
+        self.entry_pad.send_event(gstreamer::event::Eos::new())
+    }
+}
+
+/// Run `on_eos` exactly once, the first time an EOS event passes `pad`. The
+/// probe removes itself after firing.
+fn run_on_eos<F: FnOnce() + Send + 'static>(pad: &Pad, on_eos: F) {
+    let on_eos = Mutex::new(Some(on_eos));
+    pad.add_probe(
+        gstreamer::PadProbeType::EVENT_DOWNSTREAM,
+        move |_pad, info| {
+            let is_eos = matches!(
+                &info.data,
+                Some(gstreamer::PadProbeData::Event(ev)) if ev.type_() == gstreamer::EventType::Eos
+            );
+            if !is_eos {
+                return gstreamer::PadProbeReturn::Ok;
+            }
+            if let Some(cb) = on_eos.lock().unwrap().take() {
+                cb();
+            }
+            gstreamer::PadProbeReturn::Remove
+        },
+    );
+}
+
+/// Stop and remove a branch bin from the pipeline, deferred onto the main loop
+/// so it never runs inside a streaming-thread pad probe.
+fn remove_bin_async(pipeline: &Pipeline, bin: &Bin, key: &str) {
+    let pipeline = pipeline.clone();
+    let bin = bin.clone();
+    let key = key.to_string();
+    gstreamer::glib::idle_add_once(move || {
+        let name = bin.name();
+        let _ = bin.set_state(State::Null);
+        match pipeline.remove(&bin) {
+            Ok(_) => info!("[{}] removed branch bin {} from pipeline", key, name),
+            Err(_) => error!(
+                "[{}] failed to remove branch bin {} from pipeline",
+                key, name
+            ),
+        }
+    });
+}
+
+/// Decrement the outstanding-branch counter; signal `done_tx` when it hits zero.
+/// Returns the number of branches still pending.
+fn signal_branch_done(
+    remaining: &Arc<std::sync::atomic::AtomicUsize>,
+    done_tx: &std::sync::mpsc::Sender<()>,
+) -> usize {
+    let left = remaining.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
+    if left == 0 {
+        let _ = done_tx.send(());
+    }
+    left
 }
 
 #[derive(Debug)]
 #[allow(unused)]
 pub struct RoomInner {
-    name: String,
+    pub name: String,
     webrtcbin: Element,
     pipeline: Pipeline,
     tx: Sender<Stanza>,
@@ -199,6 +266,9 @@ impl Room {
             pending_pads: Mutex::new(HashMap::new()),
             main_loop: main_loop.clone(),
         }));
+
+        room.on_meeting_started();
+
         thread::spawn(move || {
             main_loop.run();
         });
@@ -269,20 +339,42 @@ impl Room {
         };
 
         let key = format!("{}-{}", endpoint.endpoint, endpoint.kind);
-        {
-            let branches = self.branches.lock().unwrap();
-            if branches.contains_key(&key) {
-                warn!(
-                    "branch {} already exists (ssrc {}), skipping duplicate",
-                    key, ssrc
-                );
-                return Ok(());
-            }
-        }
 
-        let queue = ElementFactory::make("queue").build()?;
+        let (bin, entry_pad, filesink, path) = self.build_branch(&ssrc, &encoding, &endpoint)?;
 
-        let depay = match encoding.as_str() {
+        self.pipeline.add(&bin)?;
+        bin.sync_state_with_parent()?;
+        pad.link(&entry_pad)?;
+
+        info!("recording {encoding} (ssrc={ssrc}) -> {}", path);
+        self.branches.lock().unwrap().insert(
+            key,
+            Branch {
+                bin,
+                src_pad: pad.clone(),
+                entry_pad,
+                filesink,
+            },
+        );
+        Ok(())
+    }
+
+    fn build_branch(
+        &self,
+        ssrc: &u32,
+        encoding: &str,
+        endpoint: &SourceEntry,
+    ) -> Result<(Bin, Pad, Element, String), BoolError> {
+        let bin = Bin::builder()
+            .name(format!("branch_{}", ssrc))
+            .property("message-forward", true)
+            .build();
+
+        let queue = ElementFactory::make("queue")
+            .name(format!("queue_{}", ssrc))
+            .build()?;
+
+        let depay = match encoding {
             "AV1" => ElementFactory::make("rtpav1depay").build()?,
             "VP8" => ElementFactory::make("rtpvp8depay").build()?,
             "VP9" => ElementFactory::make("rtpvp9depay").build()?,
@@ -291,21 +383,13 @@ impl Room {
             _ => unreachable!(),
         };
 
-        // Parsers needed to produce muxer-acceptable framing/alignment.
-        // AV1: av1parse converts OBU-alignment -> TU-alignment that matroskamux wants.
-        // H264: h264parse for AVC framing. OPUS: opusparse for Ogg.
-        // VP8/VP9: matroskamux accepts depayloader output directly.
-        let parse = match encoding.as_str() {
+        let parse = match encoding {
             "AV1" => Some(ElementFactory::make("av1parse").build()?),
             "H264" => Some(ElementFactory::make("h264parse").build()?),
             "OPUS" => Some(ElementFactory::make("opusparse").build()?),
             _ => None,
         };
 
-        // matroskamux for video (AV1/VP8/VP9/H264), oggmux for audio.
-        // offset-to-zero rebases the first buffer's timestamp to 0 so a
-        // late-joining participant's file starts at 00:00 instead of at the
-        // pipeline running-time when they joined.
         let (muxer, ext) = {
             let muxer = ElementFactory::make("matroskamux").build()?;
             muxer.set_property("min-index-interval", 1_000_000_000i64);
@@ -323,49 +407,21 @@ impl Room {
         );
         filesink.set_property("location", &path);
 
-        // Add and link: queue -> depay -> [parse] -> muxer -> filesink
-        self.pipeline
-            .add_many([&queue, &depay, &muxer, &filesink])?;
+        bin.add_many([&queue, &depay, &muxer, &filesink])?;
         if let Some(parse) = &parse {
-            self.pipeline.add(parse)?;
+            bin.add(parse)?;
             Element::link_many([&queue, &depay, parse, &muxer])?;
         } else {
             Element::link_many([&queue, &depay, &muxer])?;
         }
         Element::link(&muxer, &filesink)?;
 
-        // Link the webrtcbin src pad into the branch.
-        let qsink = queue
-            .static_pad("sink")
-            .ok_or(IncomingStreamError::MissingQueueSinkPad)?;
-        pad.link(&qsink)?;
+        let queue_sink = queue.static_pad("sink").unwrap();
+        let ghost = GhostPad::with_target(&queue_sink)?;
+        ghost.set_active(true)?;
+        bin.add_pad(&ghost)?;
 
-        // Bring the new branch up to the pipeline's running state.
-        // Sink-first so the muxer's downstream SEEKABLE query (at start_file)
-        // sees a ready filesink and writes a proper index.
-        filesink.sync_state_with_parent()?;
-        muxer.sync_state_with_parent()?;
-        if let Some(parse) = &parse {
-            parse.sync_state_with_parent()?;
-        }
-        depay.sync_state_with_parent()?;
-        queue.sync_state_with_parent()?;
-
-        info!("recording {} (ssrc={}) -> {}", encoding, ssrc, path);
-
-        self.branches.lock().unwrap().insert(
-            key,
-            Branch {
-                src_pad: pad.clone(),
-                queue,
-                depay,
-                parse,
-                muxer,
-                filesink,
-            },
-        );
-
-        Ok(())
+        Ok((bin, ghost.upcast(), filesink, path))
     }
 
     fn on_data_channel(&self, dc: WebRTCDataChannel) {
@@ -670,8 +726,15 @@ impl Room {
         });
     }
 
-    pub fn on_meeting_started(&self) {
+    fn on_meeting_started(&self) {
         self.timeline_handler.meeting_started();
+    }
+
+    pub fn endpoint_available(&self, endpoint: &str) -> bool {
+        self.participant_media
+            .lock()
+            .unwrap()
+            .contains_key(endpoint)
     }
 
     pub fn on_participant_joined(
@@ -818,112 +881,42 @@ impl Room {
             }
         };
 
-        let room_name = self.name.clone();
         let key = source_key.to_string();
-        info!("[finalize:{}] start (room: {})", key, room_name);
+        info!("[finalize:{}] start (room: {})", key, self.name);
 
-        let pipeline = self.pipeline.clone();
+        let fsink_pad = match branch.filesink.static_pad("sink") {
+            Some(p) => p,
+            None => {
+                error!("[finalize:{}] filesink has no sink pad, aborting", key);
+                return;
+            }
+        };
 
-        // 1. Block the webrtcbin src pad so no more buffers enter the branch.
+        // Idle-block the upstream pad so we can safely detach even when the source
+        // has already stopped, then drain EOS through the branch. Once the EOS
+        // reaches the filesink (footer/index written) we drop the bin.
         let src_pad = branch.src_pad.clone();
-        info!(
-            "[finalize:{}] adding block probe on src pad {}",
-            key,
-            src_pad.name()
-        );
+        let pipeline = self.pipeline.clone();
+        src_pad.add_probe(gstreamer::PadProbeType::IDLE, move |_pad, _info| {
+            let sent = branch.drain();
+            info!(
+                "[finalize:{}] src pad idle, EOS drained into branch: {}",
+                key, sent
+            );
 
-        src_pad.add_probe(
-            gstreamer::PadProbeType::BLOCK_DOWNSTREAM,
-            move |pad, _info| {
-                info!("[finalize:{}] src pad blocked, unlinking + sending EOS", key);
-
-                // 2. Unlink from the queue and inject EOS into the queue chain.
-                let qsink = match branch.queue.static_pad("sink") {
-                    Some(p) => p,
-                    None => {
-                        error!("[finalize:{}] queue has no sink pad, aborting", key);
-                        return gstreamer::PadProbeReturn::Remove;
-                    }
-                };
-
-                let _ = pad.unlink(&qsink);
-                info!("[finalize:{}] unlinked src pad from queue sink", key);
-
-                let eos_sent = qsink.send_event(gstreamer::event::Eos::new());
-                info!("[finalize:{}] EOS sent into queue chain: {}", key, eos_sent);
-
-                // 3. When EOS reaches the filesink, tear down the branch elements.
-                let fsink_pad = match branch.filesink.static_pad("sink") {
-                    Some(p) => p,
-                    None => {
-                        error!("[finalize:{}] filesink has no sink pad, aborting", key);
-                        return gstreamer::PadProbeReturn::Remove;
-                    }
-                };
-
-                let pipeline = pipeline.clone();
-                let mut elements = vec![
-                    branch.queue.clone(),
-                    branch.depay.clone(),
-                    branch.muxer.clone(),
-                    branch.filesink.clone(),
-                ];
-                if let Some(p) = branch.parse.clone() {
-                    elements.push(p);
-                }
-
+            let bin = branch.bin.clone();
+            let pipeline = pipeline.clone();
+            let key = key.clone();
+            run_on_eos(&fsink_pad, move || {
                 info!(
-                    "[finalize:{}] added filesink EOS probe, waiting for EOS to reach filesink ({} elements queued for removal)",
-                    key,
-                    elements.len()
+                    "[finalize:{}] EOS reached filesink — tearing down branch",
+                    key
                 );
+                remove_bin_async(&pipeline, &bin, &key);
+            });
 
-                let probe_key = key.clone();
-                fsink_pad.add_probe(
-                    gstreamer::PadProbeType::EVENT_DOWNSTREAM,
-                    move |_p, info| {
-                        if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
-                            if ev.type_() == gstreamer::EventType::Eos {
-                                info!(
-                                    "[finalize:{}] EOS reached filesink — footer written, tearing down branch",
-                                    probe_key
-                                );
-                                let elements = elements.clone();
-                                let pipeline = pipeline.clone();
-                                let idle_key = probe_key.clone();
-                                gstreamer::glib::idle_add_once(move || {
-                                    for el in &elements {
-                                        let name = el.name();
-                                        let _ = el.set_state(State::Null);
-                                        match pipeline.remove(el) {
-                                            Ok(_) => info!(
-                                                "[finalize:{}] removed element {} from pipeline",
-                                                idle_key, name
-                                            ),
-                                            Err(_) => error!(
-                                                "[finalize:{}] failed to remove element {} from pipeline",
-                                                idle_key, name
-                                            ),
-                                        }
-                                    }
-                                    info!("[finalize:{}] branch teardown complete", idle_key);
-                                });
-                                return gstreamer::PadProbeReturn::Remove;
-                            }
-                        }
-                        gstreamer::PadProbeReturn::Ok
-                    },
-                );
-
-                // Remove the block probe — we're done with it.
-                gstreamer::PadProbeReturn::Remove
-            },
-        );
-
-        info!(
-            "[finalize:{}] block probe installed, returning (finalization continues async)",
-            source_key
-        );
+            gstreamer::PadProbeReturn::Remove
+        });
     }
 
     fn shutdown(&self) {
@@ -938,51 +931,44 @@ impl Room {
             return;
         }
 
-        let total = branches.len();
-        let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(total));
+        // Drain EOS into every branch and block until each filesink has flushed
+        // its footer, so the matroska header/index rewrite completes before the
+        // pipeline is torn down. The branches stay alive in `branches` until then.
+        let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(branches.len()));
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
-        for (key, branch) in branches {
-            let fsink_pad = branch.filesink.static_pad("sink").unwrap();
-            let remaining_c = remaining.clone();
+        for (key, branch) in &branches {
+            let fsink_pad = match branch.filesink.static_pad("sink") {
+                Some(p) => p,
+                None => {
+                    let left = signal_branch_done(&remaining, &done_tx);
+                    error!(
+                        "[shutdown:{}] filesink has no sink pad, skipping ({} left)",
+                        key, left
+                    );
+                    continue;
+                }
+            };
+
+            let remaining = remaining.clone();
             let done_tx = done_tx.clone();
             let key_c = key.clone();
+            run_on_eos(&fsink_pad, move || {
+                let left = signal_branch_done(&remaining, &done_tx);
+                info!("[shutdown:{}] footer written ({} left)", key_c, left);
+            });
 
-            fsink_pad.add_probe(
-                gstreamer::PadProbeType::EVENT_DOWNSTREAM,
-                move |_p, info| {
-                    if let Some(gstreamer::PadProbeData::Event(ev)) = &info.data {
-                        if ev.type_() == gstreamer::EventType::Eos {
-                            let left =
-                                remaining_c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
-                            info!(
-                                "[shutdown:{}] filesink EOS — footer written ({} left)",
-                                key_c, left
-                            );
-                            if left == 0 {
-                                let _ = done_tx.send(());
-                            }
-                            return gstreamer::PadProbeReturn::Remove;
-                        }
-                    }
-                    gstreamer::PadProbeReturn::Ok
-                },
-            );
-
-            let qsink = branch.queue.static_pad("sink").unwrap();
-            let _ = branch.src_pad.unlink(&qsink);
-            let sent = qsink.send_event(gstreamer::event::Eos::new());
+            let sent = branch.drain();
             info!("[shutdown:{}] EOS injected: {}", key, sent);
         }
         drop(done_tx);
 
-        // BLOCK until every filesink has seen EOS (footer + index fully written).
+        // Block until every filesink has seen EOS (footer + index fully written).
         match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(_) => info!("all branches finalized for room: {}", self.name),
             Err(_) => warn!("finalize wait timed out for room: {}", self.name),
         }
 
-        // Now it's safe to tear down — the seek-back header rewrite has completed.
         let _ = self.pipeline.set_state(State::Null);
     }
 }

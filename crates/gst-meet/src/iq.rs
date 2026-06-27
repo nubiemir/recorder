@@ -86,6 +86,11 @@ impl Iq {
                         let sdp_message =
                             SDPMessage::parse_buffer(sdp_offer.to_string().as_bytes())?;
                         room.handle_session_initiate(stanza, &self.from, &self.to, sdp_message);
+                        // room.on_meeting_started();
+                        let sources = action.handle_source_add(&stanza);
+                        for parsed_source in sources {
+                            room.handle_register_ssrc(parsed_source);
+                        }
                         Ok(())
                     })();
 

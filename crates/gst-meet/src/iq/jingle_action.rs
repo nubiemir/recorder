@@ -93,6 +93,9 @@ impl<'a> JingleAction<'a> {
 
         for (endpoint_id, data) in sources {
             // RTX ssrcs from FID groups in data[1]; skip them.
+            if endpoint_id.starts_with("jvb") {
+                continue;
+            };
             let empty = vec![];
             let rtx_ssrcs: std::collections::HashSet<u32> = data[1]
                 .as_array()
