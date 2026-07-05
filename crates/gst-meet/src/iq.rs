@@ -86,6 +86,11 @@ impl Iq {
                         let sdp_message =
                             SDPMessage::parse_buffer(sdp_offer.to_string().as_bytes())?;
                         room.handle_session_initiate(stanza, &self.from, &self.to, sdp_message);
+                        // room.on_meeting_started();
+                        let sources = action.handle_source_add(&stanza);
+                        for parsed_source in sources {
+                            room.handle_register_ssrc(parsed_source);
+                        }
                         Ok(())
                     })();
 
@@ -113,8 +118,8 @@ impl Iq {
                             .get_mut(room_name)
                             .ok_or_else(|| format!("no room found for: {}", room_name))?;
 
-                        for source in sources {
-                            room.handle_register_ssrc(source.0, &source.1, &source.2);
+                        for parsed_source in sources {
+                            room.handle_register_ssrc(parsed_source);
                         }
                         Ok(())
                     })();
