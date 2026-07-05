@@ -84,6 +84,8 @@ impl RoomManager {
         if let Some(room) = self.rooms.get_mut(name) {
             room.on_meeting_terminated();
         }
-        // self.rooms.remove(name);
+        // The room's bus watcher thread holds a strong Room and keeps it
+        // alive until draining finishes, so it is safe to drop it here.
+        self.rooms.remove(name);
     }
 }

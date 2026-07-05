@@ -12,15 +12,18 @@ use crate::{
     xep::XEP,
 };
 use gstreamer::{
-    Bin, Element, ElementFactory, GhostPad, Pad, PadDirection, PadLinkError, Pipeline, Promise,
-    PromiseError, State, StateChangeError, Structure, StructureRef,
+    Bin, Bus, ClockTime, Element, ElementFactory, GhostPad, MessageView, Pad, PadDirection,
+    PadLinkError, PadProbeReturn, PadProbeType, Pipeline, Promise, PromiseError, State,
+    StateChangeError, Structure, StructureRef,
+    event::Eos,
     glib::{
         BoolError, Value,
         object::{Cast, ObjectExt},
     },
+    message::Application,
     prelude::{
-        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, PadExt,
-        PadExtManual,
+        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
+        GstObjectExt, PadExt, PadExtManual,
     },
 };
 use gstreamer_sdp::{SDPMessage, SDPMessageRef};
@@ -33,7 +36,12 @@ use std::{
     collections::HashMap,
     fs::DirBuilder,
     process::exit,
-    sync::{Arc, Mutex, OnceLock, Weak, mpsc::Sender},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+    },
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use webrtc_sdp::{
@@ -84,6 +92,17 @@ pub enum IncomingStreamError {
     StateChange(#[from] StateChangeError),
 }
 
+/// Longest the bus watcher waits after meeting termination for every muxer to
+/// finalize its file before the pipeline is forced to Null anyway.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest the bus watcher waits for timeline.json/metadata.json to be
+/// written after the pipeline has drained.
+const TIMELINE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Application message posted on the bus when the meeting terminates.
+const DRAIN_MESSAGE: &str = "room-draining";
+
 #[derive(Debug)]
 struct Media {
     audio_muted: bool,
@@ -97,6 +116,7 @@ struct Branch {
     src_pad: Pad,
     entry_pad: Pad,
     filesink: Element,
+    finalizing: bool,
 }
 
 #[derive(Debug)]
@@ -112,6 +132,7 @@ pub struct RoomInner {
     participant_media: Mutex<HashMap<String, Media>>,
     branches: Mutex<HashMap<String, Branch>>,
     pending_pads: Mutex<HashMap<u32, (Pad, gstreamer::PadProbeId)>>,
+    draining: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -197,9 +218,11 @@ impl Room {
             pwd: OnceLock::new(),
             timeline_handler: timeline_handler,
             pending_pads: Mutex::new(HashMap::new()),
+            draining: AtomicBool::new(false),
         }));
 
         room.on_meeting_started();
+        room.spawn_bus_watcher();
 
         let room_clone = room.downgrade();
         room.webrtcbin.connect_pad_added(move |_webrtc, pad| {
@@ -224,6 +247,10 @@ impl Room {
 
     pub fn on_incoming_stream(&self, pad: &Pad) -> Result<(), IncomingStreamError> {
         if pad.direction() != PadDirection::Src {
+            return Ok(());
+        }
+
+        if self.draining.load(Ordering::SeqCst) {
             return Ok(());
         }
 
@@ -282,6 +309,7 @@ impl Room {
                 src_pad: pad.clone(),
                 entry_pad,
                 filesink,
+                finalizing: false,
             },
         );
         Ok(())
@@ -748,11 +776,12 @@ impl Room {
         self.timeline_handler
             .participant_left(Some(endpoint_id.to_string()));
 
+        let prefix = format!("{endpoint_id}-");
         let keys: Vec<String> = {
             let branches = self.branches.lock().unwrap();
             branches
                 .keys()
-                .filter(|k| k.starts_with(endpoint_id))
+                .filter(|k| k.starts_with(&prefix))
                 .cloned()
                 .collect()
         };
@@ -761,10 +790,38 @@ impl Room {
         }
     }
 
+    /// Starts draining the room and returns immediately; the bus watcher
+    /// finishes the teardown once every recording has finalized.
     pub fn on_meeting_terminated(&self) {
+        if self.draining.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         self.pipeline
             .debug_to_dot_file_with_ts(gstreamer::DebugGraphDetails::all(), "shutdown_start");
-        self.shutdown();
+
+        self.timeline_handler.meeting_ended();
+
+        // Parked pads never produced a file; their block probes stay
+        // installed so nothing flows into an unlinked pad while draining.
+        self.pending_pads.lock().unwrap().clear();
+
+        {
+            let mut branches = self.branches.lock().unwrap();
+            for (key, branch) in branches.iter_mut() {
+                if !branch.finalizing {
+                    branch.finalizing = true;
+                    self.detach_branch(key, branch);
+                }
+            }
+        }
+
+        match self.pipeline.bus() {
+            Some(bus) => {
+                let _ = bus.post(Application::new(Structure::new_empty(DRAIN_MESSAGE)));
+            }
+            None => error!("no bus to signal drain for room {}", self.name),
+        }
     }
 
     pub fn handle_register_ssrc(&self, parsed_source: ParsedSource) {
@@ -796,7 +853,231 @@ impl Room {
         }
     }
 
-    fn finalize_branch(&self, source_key: &str) {}
+    /// Finalizes the recording of a single source while the rest of the
+    /// pipeline keeps running. The branch's bin is cleaned up by the bus
+    /// watcher once its filesink reports EOS.
+    fn finalize_branch(&self, source_key: &str) {
+        let mut branches = self.branches.lock().unwrap();
+        match branches.get_mut(source_key) {
+            Some(branch) if !branch.finalizing => {
+                branch.finalizing = true;
+                info!(
+                    "finalizing recording branch {source_key} in room {}",
+                    self.name
+                );
+                self.detach_branch(source_key, branch);
+            }
+            Some(_) => {}
+            None => warn!(
+                "no recording branch to finalize for {source_key} in room {}",
+                self.name
+            ),
+        }
+    }
 
-    fn shutdown(&self) {}
+    /// Cuts a branch off from webrtcbin and pushes EOS into it.
+    ///
+    /// matroskamux writes the final segment duration and cues only when it
+    /// receives EOS, by seeking back over the file; tearing the branch down
+    /// with a plain state change instead would leave a file with an unknown
+    /// duration that players can't seek. The order below matters:
+    ///
+    ///   1. drop any data still arriving on the webrtcbin pad, so unlinking
+    ///      can't surface FLOW_NOT_LINKED errors inside webrtcbin,
+    ///   2. unlink the branch from its upstream pad,
+    ///   3. send EOS into the branch and let queue/depay/muxer drain.
+    ///
+    /// When the EOS reaches the filesink — meaning the muxer has already
+    /// seeked back and rewritten the header — the branch's bin forwards it to
+    /// the bus (message-forward=true) and the bus watcher removes the bin.
+    fn detach_branch(&self, key: &str, branch: &Branch) {
+        branch
+            .src_pad
+            .add_probe(PadProbeType::DATA_DOWNSTREAM, |_pad, _info| {
+                PadProbeReturn::Drop
+            });
+
+        if let Err(err) = branch.src_pad.unlink(&branch.entry_pad) {
+            warn!(
+                "failed to unlink branch {key} in room {}: {err:?}",
+                self.name
+            );
+        }
+
+        if !branch.entry_pad.send_event(Eos::new()) {
+            error!(
+                "failed to send EOS to branch {key} in room {}; file may not finalize",
+                self.name
+            );
+        }
+    }
+
+    /// Spawns the per-room bus loop. The thread holds a strong Room so the
+    /// room stays alive after the manager drops it, until draining finishes.
+    fn spawn_bus_watcher(&self) {
+        let Some(bus) = self.pipeline.bus() else {
+            error!(
+                "pipeline has no bus for room {}; recordings will not finalize",
+                self.name
+            );
+            return;
+        };
+
+        let room = self.clone();
+        std::thread::spawn(move || room.run_bus_watcher(bus));
+    }
+
+    /// Per-room bus loop. Owns branch cleanup (on EOS forwarded from a
+    /// branch's filesink), pipeline error handling, and the final teardown
+    /// once every branch has drained or FINALIZE_TIMEOUT passed.
+    fn run_bus_watcher(&self, bus: Bus) {
+        let mut drain_deadline: Option<Instant> = None;
+
+        loop {
+            let timeout = drain_deadline.map(|deadline| {
+                ClockTime::try_from(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(ClockTime::ZERO)
+            });
+
+            match bus.timed_pop(timeout) {
+                Some(msg) => match msg.view() {
+                    MessageView::Element(_) => {
+                        if let Some(inner) = Self::forwarded_message(&msg) {
+                            if matches!(inner.view(), MessageView::Eos(_)) {
+                                if let Some(src) = inner.src() {
+                                    self.on_branch_eos(src);
+                                }
+                            }
+                        }
+                    }
+                    MessageView::Application(app) => {
+                        if app.structure().is_some_and(|s| s.name() == DRAIN_MESSAGE) {
+                            drain_deadline = Some(Instant::now() + FINALIZE_TIMEOUT);
+                        }
+                    }
+                    MessageView::Error(err) => self.on_bus_error(err),
+                    _ => {}
+                },
+                None => {
+                    error!(
+                        "timed out draining room {}; remaining recordings may be truncated",
+                        self.name
+                    );
+                    break;
+                }
+            }
+
+            if drain_deadline.is_some() && self.branches.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+
+        self.complete_drain();
+    }
+
+    /// Unwraps a message re-posted by a bin with message-forward=true.
+    fn forwarded_message(msg: &gstreamer::Message) -> Option<gstreamer::Message> {
+        let structure = msg.structure()?;
+        if structure.name() != "GstBinForwarded" {
+            return None;
+        }
+        structure.get::<gstreamer::Message>("message").ok()
+    }
+
+    /// Removes the branch whose filesink posted EOS: the file is fully
+    /// written at this point and setting the bin to Null closes it.
+    fn on_branch_eos(&self, src: &gstreamer::Object) {
+        let entry = {
+            let mut branches = self.branches.lock().unwrap();
+            let key = branches
+                .iter()
+                .find(|(_, branch)| branch.filesink.upcast_ref::<gstreamer::Object>() == src)
+                .map(|(key, _)| key.clone());
+            key.and_then(|key| branches.remove(&key).map(|branch| (key, branch)))
+        };
+
+        let Some((key, branch)) = entry else {
+            return;
+        };
+
+        if let Err(err) = self.pipeline.remove(&branch.bin) {
+            warn!(
+                "failed to remove branch {key} from pipeline in room {}: {err:?}",
+                self.name
+            );
+        }
+
+        match branch.bin.set_state(State::Null) {
+            Ok(_) => info!("finalized recording {key} in room {}", self.name),
+            Err(err) => error!(
+                "failed to stop branch {key} in room {}: {err:?}",
+                self.name
+            ),
+        }
+    }
+
+    /// Logs pipeline errors; if the error came from inside a recording
+    /// branch, tears that branch down so a drain never hangs on it.
+    fn on_bus_error(&self, err: &gstreamer::message::Error) {
+        error!(
+            "pipeline error in room {} from {:?}: {} ({:?})",
+            self.name,
+            err.src().map(|s| s.name()),
+            err.error(),
+            err.debug()
+        );
+
+        let Some(src) = err.src() else {
+            return;
+        };
+
+        let entry = {
+            let mut branches = self.branches.lock().unwrap();
+            let key = branches
+                .iter()
+                .find(|(_, branch)| src.has_as_ancestor(&branch.bin))
+                .map(|(key, _)| key.clone());
+            key.and_then(|key| branches.remove(&key).map(|branch| (key, branch)))
+        };
+
+        if let Some((key, branch)) = entry {
+            warn!(
+                "recording {key} in room {} failed; the file may be incomplete",
+                self.name
+            );
+            let _ = self.pipeline.remove(&branch.bin);
+            let _ = branch.bin.set_state(State::Null);
+        }
+    }
+
+    /// Final teardown: force-drops any branch that never delivered EOS,
+    /// stops the pipeline (closing all files), and waits for the timeline
+    /// thread to write timeline.json/metadata.json. After this, everything
+    /// the render server needs is on disk.
+    fn complete_drain(&self) {
+        let leftovers: Vec<String> = self.branches.lock().unwrap().drain().map(|(k, _)| k).collect();
+        for key in &leftovers {
+            warn!(
+                "recording {key} in room {} did not finalize; the file may be truncated",
+                self.name
+            );
+        }
+
+        if let Err(err) = self.pipeline.set_state(State::Null) {
+            error!("failed to stop pipeline for room {}: {err:?}", self.name);
+        }
+
+        if self.timeline_handler.wait_for_files(TIMELINE_WRITE_TIMEOUT) {
+            info!(
+                "room {} drained: recordings, timeline and metadata are ready for pickup",
+                self.name
+            );
+            // TODO: notify the render server from here.
+        } else {
+            error!(
+                "timeline files for room {} were not written in time",
+                self.name
+            );
+        }
+    }
 }

@@ -3,8 +3,11 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     fmt::Display,
-    sync::{Mutex, mpsc::Sender},
-    time::Instant,
+    sync::{
+        Mutex,
+        mpsc::{Receiver, Sender},
+    },
+    time::{Duration, Instant},
 };
 
 use crate::iq::jingle_action::ParsedSource;
@@ -104,16 +107,28 @@ pub struct SourceEntry {
 pub(crate) struct TimelineHandler {
     tx: Sender<TimelineEvent>,
     start_instant: Instant,
+    files_written_rx: Mutex<Receiver<()>>,
     pub ssrc_map: Mutex<HashMap<u32, SourceEntry>>,
 }
 
 impl TimelineHandler {
-    pub fn new(tx: Sender<TimelineEvent>, instant: Instant) -> Self {
+    pub fn new(tx: Sender<TimelineEvent>, instant: Instant, files_written_rx: Receiver<()>) -> Self {
         Self {
             tx,
             start_instant: instant,
+            files_written_rx: Mutex::new(files_written_rx),
             ssrc_map: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Blocks until the timeline thread has written timeline.json and
+    /// metadata.json after meeting_ended(), or the timeout passes.
+    pub fn wait_for_files(&self, timeout: Duration) -> bool {
+        self.files_written_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(timeout)
+            .is_ok()
     }
 
     fn get_relative_ms(&self) -> u128 {

@@ -42,15 +42,24 @@ impl TimelineEngine {
         start_timestamp: u128,
     ) -> TimelineHandler {
         let (tx, rx) = mpsc::channel();
+        let (files_written_tx, files_written_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
-            Self::run(rx, output_path, room, start_instant, start_timestamp);
+            Self::run(
+                rx,
+                files_written_tx,
+                output_path,
+                room,
+                start_instant,
+                start_timestamp,
+            );
         });
 
-        TimelineHandler::new(tx, start_instant)
+        TimelineHandler::new(tx, start_instant, files_written_rx)
     }
     fn run(
         rx: Receiver<TimelineEvent>,
+        files_written_tx: mpsc::Sender<()>,
         output_path: String,
         room: String,
         start_instant: Instant,
@@ -87,6 +96,8 @@ impl TimelineEngine {
 
         Self::generate_output_files(&metadata_path, &metadata);
         Self::generate_output_files(&timeline_path, &events);
+
+        let _ = files_written_tx.send(());
     }
 
     fn generate_output_files(path: &str, content: impl Serialize) {
