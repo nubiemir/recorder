@@ -15,12 +15,12 @@ use gstreamer::{
     Bin, Element, ElementFactory, GhostPad, Pad, PadDirection, PadLinkError, Pipeline, Promise,
     PromiseError, State, StateChangeError, Structure, StructureRef,
     glib::{
-        BoolError, MainLoop, Value,
+        BoolError, Value,
         object::{Cast, ObjectExt},
     },
     prelude::{
-        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
-        GstObjectExt, PadExt, PadExtManual,
+        ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual, PadExt,
+        PadExtManual,
     },
 };
 use gstreamer_sdp::{SDPMessage, SDPMessageRef};
@@ -34,7 +34,6 @@ use std::{
     fs::DirBuilder,
     process::exit,
     sync::{Arc, Mutex, OnceLock, Weak, mpsc::Sender},
-    thread,
 };
 use thiserror::Error;
 use webrtc_sdp::{
@@ -100,69 +99,6 @@ struct Branch {
     filesink: Element,
 }
 
-impl Branch {
-    /// Detach from the upstream pad and push EOS into the branch so the muxer
-    /// writes out its footer/index. Returns whether the EOS was handled.
-    fn drain(&self) -> bool {
-        let _ = self.src_pad.unlink(&self.entry_pad);
-        self.entry_pad.send_event(gstreamer::event::Eos::new())
-    }
-}
-
-/// Run `on_eos` exactly once, the first time an EOS event passes `pad`. The
-/// probe removes itself after firing.
-fn run_on_eos<F: FnOnce() + Send + 'static>(pad: &Pad, on_eos: F) {
-    let on_eos = Mutex::new(Some(on_eos));
-    pad.add_probe(
-        gstreamer::PadProbeType::EVENT_DOWNSTREAM,
-        move |_pad, info| {
-            let is_eos = matches!(
-                &info.data,
-                Some(gstreamer::PadProbeData::Event(ev)) if ev.type_() == gstreamer::EventType::Eos
-            );
-            if !is_eos {
-                return gstreamer::PadProbeReturn::Ok;
-            }
-            if let Some(cb) = on_eos.lock().unwrap().take() {
-                cb();
-            }
-            gstreamer::PadProbeReturn::Remove
-        },
-    );
-}
-
-/// Stop and remove a branch bin from the pipeline, deferred onto the main loop
-/// so it never runs inside a streaming-thread pad probe.
-fn remove_bin_async(pipeline: &Pipeline, bin: &Bin, key: &str) {
-    let pipeline = pipeline.clone();
-    let bin = bin.clone();
-    let key = key.to_string();
-    gstreamer::glib::idle_add_once(move || {
-        let name = bin.name();
-        let _ = bin.set_state(State::Null);
-        match pipeline.remove(&bin) {
-            Ok(_) => info!("[{}] removed branch bin {} from pipeline", key, name),
-            Err(_) => error!(
-                "[{}] failed to remove branch bin {} from pipeline",
-                key, name
-            ),
-        }
-    });
-}
-
-/// Decrement the outstanding-branch counter; signal `done_tx` when it hits zero.
-/// Returns the number of branches still pending.
-fn signal_branch_done(
-    remaining: &Arc<std::sync::atomic::AtomicUsize>,
-    done_tx: &std::sync::mpsc::Sender<()>,
-) -> usize {
-    let left = remaining.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
-    if left == 0 {
-        let _ = done_tx.send(());
-    }
-    left
-}
-
 #[derive(Debug)]
 #[allow(unused)]
 pub struct RoomInner {
@@ -176,7 +112,6 @@ pub struct RoomInner {
     participant_media: Mutex<HashMap<String, Media>>,
     branches: Mutex<HashMap<String, Branch>>,
     pending_pads: Mutex<HashMap<u32, (Pad, gstreamer::PadProbeId)>>,
-    main_loop: MainLoop,
 }
 
 #[derive(Debug)]
@@ -202,7 +137,6 @@ impl std::fmt::Display for Room {
 impl Drop for RoomInner {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(State::Null);
-        self.main_loop.quit();
     }
 }
 
@@ -252,7 +186,6 @@ impl Room {
         });
         let timeline_handler = Self::initialize_timeline(&name, &output_path);
 
-        let main_loop = MainLoop::new(None, false);
         let room = Room(Arc::new(RoomInner {
             name: name.clone(),
             webrtcbin,
@@ -264,14 +197,9 @@ impl Room {
             pwd: OnceLock::new(),
             timeline_handler: timeline_handler,
             pending_pads: Mutex::new(HashMap::new()),
-            main_loop: main_loop.clone(),
         }));
 
         room.on_meeting_started();
-
-        thread::spawn(move || {
-            main_loop.run();
-        });
 
         let room_clone = room.downgrade();
         room.webrtcbin.connect_pad_added(move |_webrtc, pad| {
@@ -868,107 +796,7 @@ impl Room {
         }
     }
 
-    fn finalize_branch(&self, source_key: &str) {
-        let branch = {
-            let mut branches = self.branches.lock().unwrap();
-            branches.remove(source_key)
-        };
-        let branch = match branch {
-            Some(b) => b,
-            None => {
-                warn!("finalize_branch: no branch found for key {}", source_key);
-                return;
-            }
-        };
+    fn finalize_branch(&self, source_key: &str) {}
 
-        let key = source_key.to_string();
-        info!("[finalize:{}] start (room: {})", key, self.name);
-
-        let fsink_pad = match branch.filesink.static_pad("sink") {
-            Some(p) => p,
-            None => {
-                error!("[finalize:{}] filesink has no sink pad, aborting", key);
-                return;
-            }
-        };
-
-        // Idle-block the upstream pad so we can safely detach even when the source
-        // has already stopped, then drain EOS through the branch. Once the EOS
-        // reaches the filesink (footer/index written) we drop the bin.
-        let src_pad = branch.src_pad.clone();
-        let pipeline = self.pipeline.clone();
-        src_pad.add_probe(gstreamer::PadProbeType::IDLE, move |_pad, _info| {
-            let sent = branch.drain();
-            info!(
-                "[finalize:{}] src pad idle, EOS drained into branch: {}",
-                key, sent
-            );
-
-            let bin = branch.bin.clone();
-            let pipeline = pipeline.clone();
-            let key = key.clone();
-            run_on_eos(&fsink_pad, move || {
-                info!(
-                    "[finalize:{}] EOS reached filesink — tearing down branch",
-                    key
-                );
-                remove_bin_async(&pipeline, &bin, &key);
-            });
-
-            gstreamer::PadProbeReturn::Remove
-        });
-    }
-
-    fn shutdown(&self) {
-        self.timeline_handler.meeting_ended();
-
-        let branches: Vec<(String, Branch)> = {
-            let mut b = self.branches.lock().unwrap();
-            b.drain().collect()
-        };
-        if branches.is_empty() {
-            let _ = self.pipeline.set_state(State::Null);
-            return;
-        }
-
-        // Drain EOS into every branch and block until each filesink has flushed
-        // its footer, so the matroska header/index rewrite completes before the
-        // pipeline is torn down. The branches stay alive in `branches` until then.
-        let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(branches.len()));
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-
-        for (key, branch) in &branches {
-            let fsink_pad = match branch.filesink.static_pad("sink") {
-                Some(p) => p,
-                None => {
-                    let left = signal_branch_done(&remaining, &done_tx);
-                    error!(
-                        "[shutdown:{}] filesink has no sink pad, skipping ({} left)",
-                        key, left
-                    );
-                    continue;
-                }
-            };
-
-            let remaining = remaining.clone();
-            let done_tx = done_tx.clone();
-            let key_c = key.clone();
-            run_on_eos(&fsink_pad, move || {
-                let left = signal_branch_done(&remaining, &done_tx);
-                info!("[shutdown:{}] footer written ({} left)", key_c, left);
-            });
-
-            let sent = branch.drain();
-            info!("[shutdown:{}] EOS injected: {}", key, sent);
-        }
-        drop(done_tx);
-
-        // Block until every filesink has seen EOS (footer + index fully written).
-        match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(_) => info!("all branches finalized for room: {}", self.name),
-            Err(_) => warn!("finalize wait timed out for room: {}", self.name),
-        }
-
-        let _ = self.pipeline.set_state(State::Null);
-    }
+    fn shutdown(&self) {}
 }
