@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::mpsc::{self, Receiver},
+};
 
 use gstreamer::{
     Caps, Element, ElementFactory, Pad, Pipeline, State,
@@ -9,8 +12,9 @@ use gstreamer::{
 use log::{error, info};
 
 use crate::render::{
-    layout::LayoutEngine,
-    tile::{Tile, TileContent},
+    layout::{LayoutEngine, Tile, TileContent},
+    renderer_command::RendererCommand,
+    renderer_handle::RendererHandle,
 };
 
 #[derive(Debug)]
@@ -18,9 +22,9 @@ use crate::render::{
 pub struct RendererEngine {
     pipeline: Pipeline,
     compositor: Element,
-    tiles: Mutex<HashMap<String, Tile>>, // endpoint_id → Tile
-    ssrc_map: Mutex<HashMap<u32, (String, bool)>>,
-    dominant_speaker: Mutex<Option<String>>,
+    tiles: HashMap<String, Tile>, // endpoint_id → Tile
+    ssrc_map: HashMap<u32, (String, bool)>,
+    dominant_speaker: Option<String>,
 }
 
 impl RendererEngine {
@@ -28,45 +32,129 @@ impl RendererEngine {
         Self {
             pipeline,
             compositor,
-            tiles: Mutex::new(HashMap::new()),
-            ssrc_map: Mutex::new(HashMap::new()),
-            dominant_speaker: Mutex::new(None),
+            tiles: HashMap::new(),
+            ssrc_map: HashMap::new(),
+            dominant_speaker: None,
         }
     }
 
-    // ── Participant lifecycle ─────────────────────────────────────────────
+    pub fn spawn(pipeline: Pipeline, compositor: Element) -> RendererHandle {
+        let (tx, rx) = mpsc::channel();
 
-    pub fn on_participant_joined(
-        &self,
+        std::thread::spawn(move || {
+            let mut engine = RendererEngine::new(pipeline, compositor);
+            engine.run(rx);
+        });
+
+        RendererHandle { tx: tx }
+    }
+
+    fn run(&mut self, rx: Receiver<RendererCommand>) {
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                RendererCommand::ParticipantJoined {
+                    endpoint_id,
+                    nickname,
+                    video_muted,
+                    audio_muted,
+                    screenshare_muted,
+                } => {
+                    self.on_participant_joined(
+                        &endpoint_id,
+                        &nickname,
+                        video_muted,
+                        audio_muted,
+                        screenshare_muted,
+                    );
+                }
+
+                RendererCommand::ParticipantLeft { endpoint_id } => {
+                    self.on_participant_left(&endpoint_id);
+                }
+
+                RendererCommand::SourceInfoUpdated {
+                    endpoint_id,
+                    video_muted,
+                    audio_muted,
+                    screenshare_muted,
+                } => {
+                    self.on_source_info_updated(
+                        &endpoint_id,
+                        video_muted,
+                        audio_muted,
+                        screenshare_muted,
+                    );
+                }
+
+                RendererCommand::RegisterSsrc {
+                    ssrc,
+                    endpoint_id,
+                    source_name,
+                } => {
+                    self.register_ssrc(ssrc, &endpoint_id, &source_name);
+                }
+
+                RendererCommand::EndpointForSsrc { ssrc, reply } => {
+                    let _ = reply.send(self.endpoint_for_ssrc(ssrc));
+                }
+
+                RendererCommand::IsScreenshareSsrc { ssrc, reply } => {
+                    let _ = reply.send(self.is_screenshare_ssrc(ssrc));
+                }
+
+                RendererCommand::VideoStreamArrived {
+                    endpoint_id,
+                    is_screenshare,
+                    reply,
+                } => {
+                    let pad = self.on_video_stream_arrived(&endpoint_id, is_screenshare);
+                    let _ = reply.send(pad);
+                }
+
+                RendererCommand::VideoStreamRemoved {
+                    endpoint_id,
+                    is_screenshare,
+                } => {
+                    self.on_video_stream_removed(&endpoint_id, is_screenshare);
+                }
+
+                RendererCommand::DominantSpeaker { endpoint_id } => {
+                    self.on_dominant_speaker(&endpoint_id);
+                }
+            }
+        }
+
+        info!("RendererEngine loop exited — channel closed");
+    }
+
+    fn on_participant_joined(
+        &mut self,
         endpoint_id: &str,
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
+        screenshare_muted: bool,
     ) {
-        {
-            let tiles = match self.tiles.lock() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("tiles lock: {e}");
-                    return;
-                }
-            };
-            if tiles.contains_key(endpoint_id) {
-                return;
-            }
+        if self.tiles.contains_key(endpoint_id) {
+            return;
         }
-
         info!(
             "participant joined endpoint={} nick={}",
             endpoint_id, nickname
         );
 
-        if let Err(e) = self.add_black_tile_for(endpoint_id, nickname, video_muted, audio_muted) {
+        if let Err(e) = self.add_black_tile_for(
+            endpoint_id,
+            nickname,
+            video_muted,
+            audio_muted,
+            screenshare_muted,
+        ) {
             error!("failed to add black tile for {}: {:?}", endpoint_id, e);
             return;
         }
 
-        let no_dominant = self.dominant_speaker.lock().unwrap().is_none();
+        let no_dominant = self.dominant_speaker.is_none();
         if no_dominant {
             info!("setting initial dominant speaker → {}", endpoint_id);
             self.promote_to_dominant(endpoint_id);
@@ -75,24 +163,20 @@ impl RendererEngine {
         self.recalculate_layout();
     }
 
-    pub fn on_participant_left(&self, endpoint_id: &str) {
+    fn on_participant_left(&mut self, endpoint_id: &str) {
         info!("participant left endpoint={}", endpoint_id);
         self.remove_tile(endpoint_id);
         self.recalculate_layout();
     }
 
-    // ── Source info / mute state ──────────────────────────────────────────
-
-    pub fn on_source_info_updated(
-        &self,
+    fn on_source_info_updated(
+        &mut self,
         endpoint_id: &str,
         video_muted: bool,
         audio_muted: bool,
-        has_screenshare: bool,
+        screenshare_muted: bool,
     ) {
-        let mut tiles = self.tiles.lock().unwrap();
-
-        let tile = match tiles.get_mut(endpoint_id) {
+        let tile = match self.tiles.get_mut(endpoint_id) {
             Some(t) => t,
             None => {
                 error!("source_info for unknown endpoint {}", endpoint_id);
@@ -103,50 +187,36 @@ impl RendererEngine {
         let prev_video_muted = tile.video_muted;
         tile.video_muted = video_muted;
         tile.audio_muted = audio_muted;
-        tile.has_screenshare = has_screenshare;
+        tile.screenshare_muted = screenshare_muted;
 
         if !prev_video_muted && video_muted && tile.content == TileContent::Camera {
             info!("camera off for {}, switching to black tile", endpoint_id);
-            drop(tiles);
             self.swap_to_black_tile(endpoint_id);
             self.recalculate_layout();
             return;
         }
 
-        drop(tiles);
         self.recalculate_layout();
     }
 
-    // ── SSRC map ─────────────────────────────────────────────────────────
-
-    pub fn register_ssrc(&self, ssrc: u32, endpoint_id: &str, source_name: &str) {
+    fn register_ssrc(&mut self, ssrc: u32, endpoint_id: &str, source_name: &str) {
         let is_screenshare = source_name.ends_with("-v1");
         self.ssrc_map
-            .lock()
-            .unwrap()
             .insert(ssrc, (endpoint_id.to_string(), is_screenshare));
     }
 
-    pub fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<String> {
-        self.ssrc_map
-            .lock()
-            .unwrap()
-            .get(&ssrc)
-            .map(|(ep, _)| ep.clone())
+    fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<String> {
+        self.ssrc_map.get(&ssrc).map(|(ep, _)| ep.clone())
     }
 
-    pub fn is_screenshare_ssrc(&self, ssrc: u32) -> bool {
+    fn is_screenshare_ssrc(&self, ssrc: u32) -> bool {
         self.ssrc_map
-            .lock()
-            .unwrap()
             .get(&ssrc)
             .map(|(_, is_share)| *is_share)
             .unwrap_or(false)
     }
 
-    // ── RTP stream arrived ────────────────────────────────────────────────
-
-    pub fn on_video_stream_arrived(&self, endpoint_id: &str, is_screenshare: bool) -> Option<Pad> {
+    fn on_video_stream_arrived(&mut self, endpoint_id: &str, is_screenshare: bool) -> Option<Pad> {
         info!(
             "video stream arrived endpoint={} screenshare={}",
             endpoint_id, is_screenshare
@@ -159,7 +229,7 @@ impl RendererEngine {
         self.swap_to_video(endpoint_id)
     }
 
-    pub fn on_video_stream_removed(&self, endpoint_id: &str, is_screenshare: bool) {
+    fn on_video_stream_removed(&mut self, endpoint_id: &str, is_screenshare: bool) {
         if is_screenshare {
             self.remove_screenshare_pad(endpoint_id);
         } else {
@@ -168,22 +238,13 @@ impl RendererEngine {
         self.recalculate_layout();
     }
 
-    // ── Dominant speaker ─────────────────────────────────────────────────
-
-    fn promote_to_dominant(&self, endpoint_id: &str) {
-        let mut tiles = self.tiles.lock().unwrap();
-
-        let prev = {
-            let mut dominant = self.dominant_speaker.lock().unwrap();
-            let prev = dominant.clone();
-            *dominant = Some(endpoint_id.to_string());
-            prev
-        };
+    fn promote_to_dominant(&mut self, endpoint_id: &str) {
+        let prev = self.dominant_speaker.replace(endpoint_id.to_string());
 
         // 1. Demote previous dominant
         if let Some(prev_id) = prev {
             if prev_id != endpoint_id {
-                if let Some(tile) = tiles.get_mut(&prev_id) {
+                if let Some(tile) = self.tiles.get_mut(&prev_id) {
                     if let Some(pad) = tile.large_pad.take() {
                         self.compositor.release_request_pad(&pad);
                     }
@@ -199,7 +260,7 @@ impl RendererEngine {
         }
 
         // 2. Promote new dominant
-        if let Some(tile) = tiles.get_mut(endpoint_id) {
+        if let Some(tile) = self.tiles.get_mut(endpoint_id) {
             if let Some(tee) = &tile.tee {
                 let large_pad = self.compositor.request_pad_simple("sink_%u").unwrap();
 
@@ -225,20 +286,19 @@ impl RendererEngine {
         }
     }
 
-    pub fn on_dominant_speaker(&self, endpoint_id: &str) {
+    fn on_dominant_speaker(&mut self, endpoint_id: &str) {
         info!("dominant speaker → {}", endpoint_id);
         self.promote_to_dominant(endpoint_id);
         self.recalculate_layout();
     }
 
-    // ── Internal ─────────────────────────────────────────────────────────
-
     fn add_black_tile_for(
-        &self,
+        &mut self,
         endpoint_id: &str,
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
+        screenshare_muted: bool,
     ) -> Result<(), BoolError> {
         let src = ElementFactory::make("videotestsrc")
             .property_from_str("pattern", "black")
@@ -307,15 +367,18 @@ impl RendererEngine {
             el.sync_state_with_parent()?;
         }
 
-        let mut tiles = self.tiles.lock().unwrap();
-        let tile = tiles.entry(endpoint_id.to_string()).or_insert_with(|| {
-            Tile::new(
-                endpoint_id.to_string(),
-                nickname.to_string(),
-                video_muted,
-                audio_muted,
-            )
-        });
+        let tile = self
+            .tiles
+            .entry(endpoint_id.to_string())
+            .or_insert_with(|| {
+                Tile::new(
+                    endpoint_id.to_string(),
+                    nickname.to_string(),
+                    video_muted,
+                    audio_muted,
+                    screenshare_muted,
+                )
+            });
 
         tile.content = TileContent::BlackTile;
         tile.compositor_pad = Some(compositor_pad);
@@ -330,16 +393,8 @@ impl RendererEngine {
         Ok(())
     }
 
-    fn swap_to_video(&self, endpoint_id: &str) -> Option<Pad> {
-        let mut tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(err) => {
-                error!("failed to acquire tiles lock: {err}");
-                return None;
-            }
-        };
-
-        let tile = tiles.get_mut(endpoint_id)?;
+    fn swap_to_video(&mut self, endpoint_id: &str) -> Option<Pad> {
+        let tile = self.tiles.get_mut(endpoint_id)?;
 
         // Tear down ONLY the black generator elements upstream of the Tee
         for el in [
@@ -363,13 +418,8 @@ impl RendererEngine {
         tile.tee.as_ref().and_then(|tee| tee.static_pad("sink"))
     }
 
-    fn swap_to_black_tile(&self, endpoint_id: &str) {
-        let mut tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(err) => return,
-        };
-
-        let tile = match tiles.get_mut(endpoint_id) {
+    fn swap_to_black_tile(&mut self, endpoint_id: &str) {
+        let tile = match self.tiles.get_mut(endpoint_id) {
             Some(t) => t,
             None => return,
         };
@@ -425,43 +475,29 @@ impl RendererEngine {
         }
     }
 
-    fn add_screenshare_pad(&self, endpoint_id: &str) -> Option<Pad> {
+    fn add_screenshare_pad(&mut self, endpoint_id: &str) -> Option<Pad> {
         let pad = self.compositor.request_pad_simple("sink_%u")?;
-        let mut tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(_) => return None,
-        };
 
-        if let Some(tile) = tiles.get_mut(endpoint_id) {
+        if let Some(tile) = self.tiles.get_mut(endpoint_id) {
             tile.screenshare_compositor_pad = Some(pad.clone());
-            tile.has_screenshare = true;
+            tile.screenshare_muted = false;
         }
 
         self.recalculate_layout();
         Some(pad)
     }
 
-    fn remove_screenshare_pad(&self, endpoint_id: &str) {
-        let mut tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(_) => return,
-        };
-
-        if let Some(tile) = tiles.get_mut(endpoint_id) {
+    fn remove_screenshare_pad(&mut self, endpoint_id: &str) {
+        if let Some(tile) = self.tiles.get_mut(endpoint_id) {
             if let Some(pad) = tile.screenshare_compositor_pad.take() {
                 self.compositor.release_request_pad(&pad);
             }
-            tile.has_screenshare = false;
+            tile.screenshare_muted = true;
         }
     }
 
-    fn remove_tile(&self, endpoint_id: &str) {
-        let mut tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(_) => return,
-        };
-
-        if let Some(mut tile) = tiles.remove(endpoint_id) {
+    fn remove_tile(&mut self, endpoint_id: &str) {
+        if let Some(mut tile) = self.tiles.remove(endpoint_id) {
             // Clean up ALL elements associated with this participant
             for el in [
                 tile.black_src.take(),
@@ -493,35 +529,21 @@ impl RendererEngine {
     }
 
     fn recalculate_layout(&self) {
-        let tiles = match self.tiles.lock() {
-            Ok(tiles) => tiles,
-            Err(err) => {
-                error!("failed to acquire tiles lock: {err}");
-                return;
-            }
-        };
-        let dominant = match self.dominant_speaker.lock() {
-            Ok(dominant) => dominant,
-            Err(err) => {
-                error!("failed to acquire dominant lock: {err}");
-                return;
-            }
-        };
-
-        let tile_info: Vec<(&String, bool, bool)> = tiles
+        let tile_info: Vec<(&String, bool, bool)> = self
+            .tiles
             .iter()
             .map(|(ep, t)| {
-                let is_dom = dominant.as_deref() == Some(ep.as_str());
-                (ep, t.has_screenshare, is_dom)
+                let is_dom = self.dominant_speaker.as_deref() == Some(ep.as_str());
+                (ep, !t.screenshare_muted, is_dom)
             })
             .collect();
 
-        let rects = LayoutEngine::calculate(&tile_info, dominant.as_deref());
+        let rects = LayoutEngine::calculate(&tile_info, self.dominant_speaker.as_deref());
 
         LayoutEngine::apply(
             &rects,
             |ep, is_screenshare| {
-                tiles.get(ep).and_then(|t| {
+                self.tiles.get(ep).and_then(|t| {
                     if is_screenshare {
                         t.screenshare_compositor_pad.clone()
                     } else {
@@ -529,7 +551,16 @@ impl RendererEngine {
                     }
                 })
             },
-            |ep| tiles.get(ep).and_then(|t| t.large_pad.clone()),
+            |ep| {
+                // large pad: if screensharing use screenshare pad, else use large_pad
+                self.tiles.get(ep).and_then(|t| {
+                    if !t.screenshare_muted {
+                        t.screenshare_compositor_pad.clone()
+                    } else {
+                        t.large_pad.clone()
+                    }
+                })
+            },
         );
     }
 }

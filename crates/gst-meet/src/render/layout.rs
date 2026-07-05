@@ -1,9 +1,71 @@
-use gstreamer::{Pad, glib::object::ObjectExt};
+use gstreamer::{Element, Pad, glib::object::ObjectExt};
 
 pub const SCREEN_W: i32 = 1920;
 pub const SCREEN_H: i32 = 1080;
-pub const SMALL_TILE_W: i32 = 250;
-pub const SMALL_TILE_H: i32 = 250;
+pub const SMALL_TILE_W: i32 = 200;
+pub const SMALL_TILE_H: i32 = 150;
+
+#[derive(Debug, PartialEq, PartialOrd)]
+#[allow(unused)]
+pub enum TileContent {
+    BlackTile,
+    Camera,
+    Screenshare,
+}
+
+#[derive(Debug)]
+#[allow(unused)]
+pub struct Tile {
+    pub endpoint: String,
+    pub nickname: String,
+    pub content: TileContent,
+    pub black_src: Option<Element>,
+    pub text_overlay: Option<Element>,
+    pub convert: Option<Element>,
+    pub caps_filter: Option<Element>,
+    pub compositor_pad: Option<Pad>,
+    pub large_pad: Option<Pad>,
+    pub border_pad: Option<Pad>,
+    pub screenshare_compositor_pad: Option<Pad>,
+    pub screenshare_muted: bool,
+    pub video_muted: bool,
+    pub audio_muted: bool,
+    pub tee: Option<Element>,
+    pub thumb_queue: Option<Element>,
+    pub large_queue: Option<Element>,
+    pub large_tee_pad: Option<Pad>,
+}
+
+impl Tile {
+    pub fn new(
+        endpoint: String,
+        nickname: String,
+        video_muted: bool,
+        audio_muted: bool,
+        screenshare_muted: bool,
+    ) -> Self {
+        Self {
+            endpoint,
+            nickname,
+            content: TileContent::BlackTile,
+            black_src: None,
+            text_overlay: None,
+            convert: None,
+            compositor_pad: None,
+            caps_filter: None,
+            large_pad: None,
+            border_pad: None,
+            screenshare_compositor_pad: None,
+            screenshare_muted,
+            video_muted,
+            audio_muted,
+            thumb_queue: None,
+            large_queue: None,
+            large_tee_pad: None,
+            tee: None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TileRect {
@@ -28,39 +90,38 @@ impl LayoutEngine {
     ) -> Vec<TileRect> {
         let mut rects = vec![];
 
-        // ── Screenshare layout ────────────────────────────────────────────────
         let screensharer = tiles.iter().find(|(_, has_share, _)| *has_share);
 
         if let Some((share_ep, _, _)) = screensharer {
-            let share_w = (SCREEN_W as f64 * 0.75) as i32;
+            let small_count = tiles.len();
+            let strip_cols = if small_count > 10 { 2 } else { 1 };
+            let total_small_w = SCREEN_W - (SMALL_TILE_W * strip_cols);
 
-            // screenshare takes left 75%
+            // screenshare takes full screen, bottom layer
             rects.push(TileRect {
                 endpoint: share_ep.to_string(),
                 xpos: 0,
                 ypos: 0,
-                width: share_w,
+                width: SCREEN_W,
                 height: SCREEN_H,
                 is_screenshare: true,
-                is_dominant_large: true,
+                is_dominant_large: false,
                 is_highlighted: false,
                 zorder: 0,
             });
 
-            // all cameras stacked on right 25%
-            let cameras: Vec<_> = tiles.iter().collect();
-            let count = cameras.len().max(1);
-            let tile_w = SCREEN_W - share_w;
-            let tile_h = SCREEN_H / count as i32;
+            // all camera thumbnails on top-right including sharer's camera
+            for (i, (ep, _, _)) in tiles.iter().enumerate() {
+                let col = i as i32 % strip_cols;
+                let row = i as i32 / strip_cols;
 
-            for (i, (ep, _, _)) in cameras.iter().enumerate() {
                 rects.push(TileRect {
                     endpoint: ep.to_string(),
-                    xpos: share_w,
-                    ypos: i as i32 * tile_h,
-                    width: tile_w,
-                    height: tile_h,
-                    is_screenshare: false,
+                    xpos: total_small_w + col * SMALL_TILE_W,
+                    ypos: row * SMALL_TILE_H,
+                    width: SMALL_TILE_W,
+                    height: SMALL_TILE_H,
+                    is_screenshare: false, // ← routes to compositor_pad (camera)
                     is_dominant_large: false,
                     is_highlighted: ep.as_str() == share_ep.as_str(),
                     zorder: 1,
