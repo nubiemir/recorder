@@ -853,9 +853,6 @@ impl Room {
         }
     }
 
-    /// Finalizes the recording of a single source while the rest of the
-    /// pipeline keeps running. The branch's bin is cleaned up by the bus
-    /// watcher once its filesink reports EOS.
     fn finalize_branch(&self, source_key: &str) {
         let mut branches = self.branches.lock().unwrap();
         match branches.get_mut(source_key) {
@@ -875,21 +872,6 @@ impl Room {
         }
     }
 
-    /// Cuts a branch off from webrtcbin and pushes EOS into it.
-    ///
-    /// matroskamux writes the final segment duration and cues only when it
-    /// receives EOS, by seeking back over the file; tearing the branch down
-    /// with a plain state change instead would leave a file with an unknown
-    /// duration that players can't seek. The order below matters:
-    ///
-    ///   1. drop any data still arriving on the webrtcbin pad, so unlinking
-    ///      can't surface FLOW_NOT_LINKED errors inside webrtcbin,
-    ///   2. unlink the branch from its upstream pad,
-    ///   3. send EOS into the branch and let queue/depay/muxer drain.
-    ///
-    /// When the EOS reaches the filesink — meaning the muxer has already
-    /// seeked back and rewritten the header — the branch's bin forwards it to
-    /// the bus (message-forward=true) and the bus watcher removes the bin.
     fn detach_branch(&self, key: &str, branch: &Branch) {
         branch
             .src_pad
@@ -912,8 +894,6 @@ impl Room {
         }
     }
 
-    /// Spawns the per-room bus loop. The thread holds a strong Room so the
-    /// room stays alive after the manager drops it, until draining finishes.
     fn spawn_bus_watcher(&self) {
         let Some(bus) = self.pipeline.bus() else {
             error!(
@@ -927,9 +907,6 @@ impl Room {
         std::thread::spawn(move || room.run_bus_watcher(bus));
     }
 
-    /// Per-room bus loop. Owns branch cleanup (on EOS forwarded from a
-    /// branch's filesink), pipeline error handling, and the final teardown
-    /// once every branch has drained or FINALIZE_TIMEOUT passed.
     fn run_bus_watcher(&self, bus: Bus) {
         let mut drain_deadline: Option<Instant> = None;
 
@@ -975,7 +952,6 @@ impl Room {
         self.complete_drain();
     }
 
-    /// Unwraps a message re-posted by a bin with message-forward=true.
     fn forwarded_message(msg: &gstreamer::Message) -> Option<gstreamer::Message> {
         let structure = msg.structure()?;
         if structure.name() != "GstBinForwarded" {
@@ -984,8 +960,6 @@ impl Room {
         structure.get::<gstreamer::Message>("message").ok()
     }
 
-    /// Removes the branch whose filesink posted EOS: the file is fully
-    /// written at this point and setting the bin to Null closes it.
     fn on_branch_eos(&self, src: &gstreamer::Object) {
         let entry = {
             let mut branches = self.branches.lock().unwrap();
@@ -1009,15 +983,10 @@ impl Room {
 
         match branch.bin.set_state(State::Null) {
             Ok(_) => info!("finalized recording {key} in room {}", self.name),
-            Err(err) => error!(
-                "failed to stop branch {key} in room {}: {err:?}",
-                self.name
-            ),
+            Err(err) => error!("failed to stop branch {key} in room {}: {err:?}", self.name),
         }
     }
 
-    /// Logs pipeline errors; if the error came from inside a recording
-    /// branch, tears that branch down so a drain never hangs on it.
     fn on_bus_error(&self, err: &gstreamer::message::Error) {
         error!(
             "pipeline error in room {} from {:?}: {} ({:?})",
@@ -1050,12 +1019,14 @@ impl Room {
         }
     }
 
-    /// Final teardown: force-drops any branch that never delivered EOS,
-    /// stops the pipeline (closing all files), and waits for the timeline
-    /// thread to write timeline.json/metadata.json. After this, everything
-    /// the render server needs is on disk.
     fn complete_drain(&self) {
-        let leftovers: Vec<String> = self.branches.lock().unwrap().drain().map(|(k, _)| k).collect();
+        let leftovers: Vec<String> = self
+            .branches
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(k, _)| k)
+            .collect();
         for key in &leftovers {
             warn!(
                 "recording {key} in room {} did not finalize; the file may be truncated",
