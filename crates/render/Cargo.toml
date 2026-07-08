@@ -1,0 +1,8 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gstreamer.workspace = true
+log.workspace = true

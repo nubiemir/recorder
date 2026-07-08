@@ -3,7 +3,7 @@ resolver = "3"
 
 members = [
   "crates/gst-meet",
-  "crates/gst-recorder",
+  "crates/gst-recorder", "crates/render",
 ]
 
 default-members = ["crates/gst-recorder"]
