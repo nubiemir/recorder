@@ -35,12 +35,6 @@ impl RoomManager {
         self.rooms.contains_key(name)
     }
 
-    // pub fn on_meeting_started(&self, name: &str) {
-    //     if let Some(room) = self.get(name) {
-    //         room.on_meeting_started();
-    //     }
-    // }
-
     pub fn on_participant_joined(
         &mut self,
         name: &str,
@@ -65,6 +59,7 @@ impl RoomManager {
             } else {
                 room.source_info_updated(
                     &participant.endpoint_id,
+                    &participant.display_name.unwrap_or_default(),
                     participant.video_muted,
                     participant.audio_muted,
                     participant.screenshare_muted,

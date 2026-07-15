@@ -11,7 +11,7 @@ use gstreamer::{
 
 use log::{error, info};
 
-use crate::render::{
+use crate::{
     layout::{LayoutEngine, Tile, TileContent},
     renderer_command::RendererCommand,
     renderer_handle::RendererHandle,
