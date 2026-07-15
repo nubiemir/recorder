@@ -1,4 +1,5 @@
 use crate::{
+    avatar::generate_avatar,
     config::Webrtc,
     get_attribute,
     iq::{Iq, jingle_action::ParsedSource},
@@ -108,6 +109,7 @@ struct Media {
     audio_muted: bool,
     video_muted: bool,
     screenshare_muted: bool,
+    avatare_generated: bool,
 }
 
 #[derive(Debug)]
@@ -703,14 +705,40 @@ impl Room {
     ) {
         let mut par_media = self.participant_media.lock().unwrap();
 
-        par_media.insert(
-            endpoint_id.to_string(),
-            Media {
-                audio_muted,
-                video_muted,
-                screenshare_muted,
-            },
+        let mut media = Media {
+            audio_muted,
+            video_muted,
+            screenshare_muted,
+            avatare_generated: false,
+        };
+
+        let path = format!(
+            "recordings/{}/{}/{}.{}",
+            self.name, endpoint_id, "avatar", "png"
         );
+
+        let dir_path = format!("recordings/{}/{}", self.name, endpoint_id,);
+
+        match DirBuilder::new().recursive(true).create(&dir_path) {
+            Err(err) => {
+                error!("failed to create directory for: {} err: {err:?}", dir_path);
+            }
+            _ => {}
+        }
+
+        if video_muted {
+            match generate_avatar(nickname, &path) {
+                Ok(_) => {
+                    info!("avatar generated");
+                    media.avatare_generated = true
+                }
+                Err(err) => {
+                    error!("failed to generate avatar: {}", err);
+                }
+            }
+        }
+
+        par_media.insert(endpoint_id.to_string(), media);
 
         self.timeline_handler.participant_joined(
             Some(endpoint_id.to_string()),
@@ -723,6 +751,7 @@ impl Room {
     pub fn source_info_updated(
         &mut self,
         endpoint_id: &str,
+        nickname: &str,
         video_muted: bool,
         audio_muted: bool,
         screenshare_muted: bool,
@@ -730,7 +759,35 @@ impl Room {
         let mut par_media = self.participant_media.lock().unwrap();
         let participant = par_media.get(endpoint_id);
 
+        let path = format!(
+            "recordings/{}/{}/{}.{}",
+            self.name, endpoint_id, "avatar", "png"
+        );
+
+        let dir_path = format!("recordings/{}/{}", self.name, endpoint_id,);
+
+        match DirBuilder::new().recursive(true).create(&dir_path) {
+            Err(err) => {
+                error!("failed to create directory for: {} err: {err:?}", dir_path);
+            }
+            _ => {}
+        }
+
         if let Some(participant) = participant {
+            let mut avatar_generated = false;
+
+            if !participant.avatare_generated && video_muted {
+                match generate_avatar(nickname, &path) {
+                    Ok(_) => {
+                        info!("avatar generated");
+                        avatar_generated = true;
+                    }
+                    Err(err) => {
+                        error!("failed to generate avatar: {}", err);
+                    }
+                }
+            }
+
             if participant.video_muted != video_muted {
                 if participant.video_muted {
                     self.timeline_handler
@@ -760,16 +817,17 @@ impl Room {
                         .screenshare_off(Some(endpoint_id.to_string()));
                 }
             }
-        }
 
-        par_media.insert(
-            endpoint_id.to_string(),
-            Media {
-                audio_muted,
-                video_muted,
-                screenshare_muted,
-            },
-        );
+            par_media.insert(
+                endpoint_id.to_string(),
+                Media {
+                    audio_muted,
+                    video_muted,
+                    screenshare_muted,
+                    avatare_generated: avatar_generated,
+                },
+            );
+        }
     }
 
     pub fn on_participant_left(&mut self, endpoint_id: &str) {

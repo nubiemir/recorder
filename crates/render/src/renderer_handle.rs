@@ -2,7 +2,7 @@ use std::sync::mpsc::{self, Sender};
 
 use gstreamer::Pad;
 
-use crate::render::renderer_command::RendererCommand;
+use crate::renderer_command::RendererCommand;
 
 #[derive(Clone, Debug)]
 pub struct RendererHandle {

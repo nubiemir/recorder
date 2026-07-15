@@ -18,3 +18,6 @@ gstreamer-sdp.workspace = true
 gstreamer-webrtc.workspace = true
 config.workspace = true
 webrtc-sdp.workspace = true
+cairo-rs.workspace = true
+regex.workspace = true
+unicode-segmentation.workspace = true
