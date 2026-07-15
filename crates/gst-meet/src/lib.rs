@@ -1,3 +1,4 @@
+pub mod avatar;
 pub mod config;
 pub mod iq;
 pub mod macros;

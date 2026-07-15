@@ -4,5 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-gstreamer.workspace = true
 log.workspace = true
+
+gstreamer.workspace = true
+gstreamer-editing-services.workspace = true
