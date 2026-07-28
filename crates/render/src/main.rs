@@ -1,9 +1,23 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, thread};
 
 use gstreamer::{Caps, ClockTime, MessageView, State};
 use gstreamer_editing_services::{self as ges, gst_pbutils, prelude::*};
+use log::{error, info, warn};
+use tiny_http::{Request, Response, Server};
 
-fn ges_test() -> Result<(), Box<dyn std::error::Error>> {
+use crate::{
+    clip::Clip,
+    layout::{active_speaker::ActiveSpeaker, segment_with},
+    renderer::Renderer,
+    timeline::{Timeline, TimelineError},
+};
+
+mod clip;
+mod layout;
+mod renderer;
+mod timeline;
+
+fn _ges_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Timeline with one audio + one video track
     let timeline = ges::Timeline::new_audio_video();
     let layer = timeline.append_layer();
@@ -76,8 +90,80 @@ fn ges_test() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+type Result<T> = std::result::Result<T, RenderError>;
+
+#[derive(Debug, thiserror::Error)]
+enum RenderError {
+    #[error("io error: {0}")]
+    IOError(#[from] std::io::Error),
+
+    #[error("timeline error: {0}")]
+    TimelineError(#[from] TimelineError),
+}
+
+fn parse_room(request: &Request) -> String {
+    let url = request.url();
+
+    if let Some(pos) = url.find("room=") {
+        let query_value = &url[pos + 5..];
+        let room_name = query_value.split('&').next().unwrap_or(query_value);
+        return room_name.to_string();
+    }
+
+    "unknown_room".to_string()
+}
+
+fn process_request(room_name: &str) -> Result<Timeline> {
+    warn!("found this room: {}", room_name);
+    let format_path = format!("recordings/{}/timeline.json", room_name);
+    let path = Path::new(&format_path).canonicalize()?;
+    let timeline = Timeline::load_timeline(path.to_str().unwrap_or_default())?;
+    Ok(timeline)
+}
+
 fn main() {
+    env_logger::init();
+
     gstreamer::init().expect("failed to initialize gstreamer");
     ges::init().expect("failed to initialize GES");
-    ges_test().expect("hello something went wrong");
+
+    let server = Server::http(&format!("127.0.0.1:3333"));
+
+    match server {
+        Ok(server) => {
+            info!("started listening on: {:?}", server.server_addr());
+
+            for request in server.incoming_requests() {
+                thread::spawn(move || {
+                    let room = parse_room(&request);
+
+                    let timeline = process_request(&room).unwrap();
+                    let segments = segment_with(ActiveSpeaker::default(), &timeline);
+                    let clips = Clip::to_clips(&timeline, &segments, &format!("recordings/{room}"));
+                    let renderer = Renderer::build(&clips);
+                    match renderer {
+                        Ok(renderer) => match renderer.render(&format!("recordings/{room}")) {
+                            Ok(_) => {
+                                info!("successfully renderered mp4 file");
+                            }
+                            Err(err) => {
+                                error!("failed to produce final file error: {:#?}", err);
+                            }
+                        },
+                        Err(err) => {
+                            error!("renderer error: {:#?}", err);
+                        }
+                    }
+
+                    let message = format!("successfully joined room: {}", room);
+                    let response = Response::from_string(message).with_status_code(200); // Forces standard HTTP compliance
+
+                    let _ = request.respond(response);
+                });
+            }
+        }
+        Err(err) => {
+            error!("error starting server: {:?}", err);
+        }
+    }
 }
