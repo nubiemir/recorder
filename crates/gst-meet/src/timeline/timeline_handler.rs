@@ -13,7 +13,6 @@ use std::{
 use crate::iq::jingle_action::ParsedSource;
 
 #[derive(Debug, Serialize)]
-#[serde(tag = "eventType")]
 pub enum TimelineEvent {
     MeetingStart {
         timestamp_ms: u128,
@@ -112,7 +111,11 @@ pub(crate) struct TimelineHandler {
 }
 
 impl TimelineHandler {
-    pub fn new(tx: Sender<TimelineEvent>, instant: Instant, files_written_rx: Receiver<()>) -> Self {
+    pub fn new(
+        tx: Sender<TimelineEvent>,
+        instant: Instant,
+        files_written_rx: Receiver<()>,
+    ) -> Self {
         Self {
             tx,
             start_instant: instant,
@@ -287,21 +290,4 @@ impl TimelineHandler {
     pub fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<SourceEntry> {
         self.ssrc_map.lock().unwrap().get(&ssrc).cloned()
     }
-
-    // pub fn is_audio_ssrc(&self, ssrc: u32) -> bool {
-    //     self.ssrc_map
-    //         .lock()
-    //         .unwrap()
-    //         .get(&ssrc)
-    //         .map(|e| e.kind)
-    //         .unwrap_or(false)
-    // }
-    // pub fn is_screenshare_ssrc(&self, ssrc: u32) -> bool {
-    //     self.ssrc_map
-    //         .lock()
-    //         .unwrap()
-    //         .get(&ssrc)
-    //         .map(|e| e.is_screenshare)
-    //         .unwrap_or(false)
-    // }
 }

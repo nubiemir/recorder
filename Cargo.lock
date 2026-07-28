@@ -1397,9 +1397,14 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "render"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "gstreamer",
  "gstreamer-editing-services",
  "log",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tiny_http",
 ]
 
 [[package]]
