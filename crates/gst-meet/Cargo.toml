@@ -5,6 +5,7 @@ edition.workspace = true
 
 
 [dependencies]
+vodozemac = "0.10.0"
 libstrophe.workspace = true 
 log.workspace = true
 env_logger.workspace = true
