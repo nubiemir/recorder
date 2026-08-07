@@ -4,7 +4,6 @@ use std::{
 };
 
 use cairo::{Context, Error, FontSlant, FontWeight, Format, ImageSurface};
-use log::warn;
 use regex::Regex;
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
@@ -89,8 +88,6 @@ fn hex_to_rgb(hex: &str) -> (f64, f64, f64) {
 pub fn generate_avatar(nickname: &str, path: &str) -> Result<(), AvataError> {
     const WIDTH: i32 = 1920;
     const HEIGHT: i32 = 1080;
-
-    warn!("path: {}", path);
 
     let surface = ImageSurface::create(Format::ARgb32, WIDTH, HEIGHT)?;
     let cr = Context::new(&surface)?;
