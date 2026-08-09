@@ -1,3 +1,11 @@
+//! The XMPP client: connection setup and stanza dispatch.
+//!
+//! One connection serves every meeting the recorder is in. Incoming presence
+//! and IQ stanzas are dispatched to the [`RoomManager`], and outgoing stanzas
+//! are queued on an mpsc channel that a timed handler flushes on the
+//! connection thread — libstrophe's connection is not `Sync`, so the room
+//! threads can never touch it directly.
+
 use libstrophe::{
     ConnectClientError, Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult,
     Stanza,
@@ -21,6 +29,7 @@ use crate::{
     room_manager::{RoomManager, Rooms},
 };
 
+/// Failures from connecting to XMPP or building and queueing stanzas.
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("failed to initialize xmpp: {0}")]
@@ -46,6 +55,8 @@ pub enum AppError {
     Unkown,
 }
 
+/// A connected XMPP client. Holding it keeps the libstrophe context alive;
+/// [`App::xmpp_run`] then drives the event loop.
 #[allow(unused)]
 pub struct App {
     xmpp_context: Context<'static, 'static>,
@@ -60,6 +71,11 @@ impl App {
         }
     }
 
+    /// Builds an unconnected client for `jid`.
+    ///
+    /// TLS is disabled because the recorder is expected to run beside the
+    /// XMPP server on a trusted network; over an untrusted one this sends
+    /// credentials in the clear.
     fn init_xmpp_connection(
         jid: &str,
         password: &str,
@@ -76,6 +92,11 @@ impl App {
         return Ok(conn);
     }
 
+    /// Builds the connection-event callback.
+    ///
+    /// On connect it installs three handlers: a zero-delay timed handler that
+    /// flushes the outgoing stanza queue, and the presence and IQ handlers.
+    /// Disconnect stops the context, which ends [`App::xmpp_run`].
     fn xmpp_connection_handler(
         webrtc: Webrtc,
         tx: Sender<Stanza>,
@@ -129,6 +150,8 @@ impl App {
         }
     }
 
+    /// IQ handler: routes `<jingle>` to session handling and `<query>` to
+    /// service discovery, ignoring anything else.
     fn handle_iq(
         room_manager: Rooms,
         tx: Sender<Stanza>,
@@ -153,6 +176,8 @@ impl App {
         }
     }
 
+    /// Presence handler: classifies the stanza and forwards it to the room
+    /// manager. The room name is the local part of the sender's JID.
     fn handle_presence(
         room_manager: Rooms,
         tx: Sender<Stanza>,
@@ -204,6 +229,8 @@ impl App {
         }
     }
 
+    /// Connects to the configured server. `rx` is the queue this client drains
+    /// to send stanzas the rooms produce; `tx` is handed to those rooms.
     pub fn connect(
         config: &ConfigSettings,
         room_manager: RoomManager,
@@ -225,10 +252,16 @@ impl App {
         }
     }
 
+    /// Runs the XMPP event loop on the calling thread until disconnect.
     pub fn xmpp_run(&mut self) {
         self.xmpp_context.run();
     }
 
+    /// Queues MUC presence to join `room`, using a random nickname as the
+    /// recorder's endpoint id.
+    ///
+    /// Returns as soon as the stanza is queued — the room itself is created
+    /// later, when the server's presence reply comes back.
     pub fn handle_join_room(tx: &Sender<Stanza>, room: &str) -> Result<String, AppError> {
         debug!("room: {room}");
 

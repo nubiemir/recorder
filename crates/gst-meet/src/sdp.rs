@@ -1,3 +1,9 @@
+//! The return leg of the negotiation: SDP answer to Jingle `session-accept`.
+//!
+//! `iq::jingle_action` turns Jingle into the SDP offer; once
+//! `webrtcbin` produces an answer, this walks that answer and rebuilds it as
+//! Jingle content for the focus.
+
 use std::ops::Deref;
 
 use libstrophe::{Error, Stanza};
@@ -15,6 +21,7 @@ use webrtc_sdp::{
 
 use crate::{make_stanza, set_attribute, xep::XEP};
 
+/// Borrowed view over a parsed SDP session that can render itself as Jingle.
 pub struct Sdp<'a>(&'a SdpSession);
 
 impl<'a> Deref for Sdp<'a> {
@@ -30,6 +37,10 @@ impl<'a> Sdp<'a> {
         Sdp(sdp_session)
     }
 
+    /// Builds the `session-accept` stanza carrying this SDP answer.
+    ///
+    /// `initiator` and `sid` must match the `session-initiate` being answered;
+    /// `responder` is the recorder's own JID.
     pub fn parse_sdp_to_jingle(
         &self,
         initiator: &str,
@@ -51,6 +62,7 @@ impl<'a> Sdp<'a> {
         Ok(jingle_stanza)
     }
 
+    /// Mirrors the session-level BUNDLE group back as a Jingle `<group>`.
     fn parse_group(&self, stanza: &mut Stanza) -> Result<(), Error> {
         let sdp_group = self.get_attribute(SdpAttributeType::Group);
         if let Some(group) = sdp_group {
@@ -72,6 +84,11 @@ impl<'a> Sdp<'a> {
         Ok(())
     }
 
+    /// Emits one `<content>` per m-line, carrying payload types, their fmtp
+    /// parameters and feedback, plus the transport.
+    ///
+    /// Only audio and video get a description and transport; other m-lines
+    /// (the data channel) produce an empty content element.
     fn parse_media(&self, jingle_stanza: &mut Stanza) -> Result<(), Error> {
         for media in self.media.iter() {
             let media_type = media.get_type().to_string();
@@ -141,6 +158,7 @@ impl<'a> Sdp<'a> {
         Ok(())
     }
 
+    /// Whether the m-line carries `a=rtcp-mux`.
     fn rtcp_mux_exist(&self, media: &SdpMedia) -> bool {
         let rtcp_mux = media
             .get_attributes()
@@ -153,6 +171,7 @@ impl<'a> Sdp<'a> {
         rtcp_mux
     }
 
+    /// Looks up the `a=rtpmap` for a payload type.
     fn find_rtpmap(&self, media: &'a SdpMedia, format: u32) -> Option<&'a SdpAttributeRtpmap> {
         let rtpmap = media.get_attributes().iter().find_map(|attr| match attr {
             SdpAttribute::Rtpmap(rtpmap) if rtpmap.payload_type as u32 == format => Some(rtpmap),
@@ -161,6 +180,7 @@ impl<'a> Sdp<'a> {
         rtpmap
     }
 
+    /// Looks up the `a=fmtp` for a payload type.
     fn find_fmtp(&self, media: &'a SdpMedia, format: u32) -> Option<&'a SdpAttributeFmtp> {
         let fmtp = media.get_attributes().iter().find_map(|attr| match attr {
             SdpAttribute::Fmtp(fmtp) if fmtp.payload_type as u32 == format => Some(fmtp),
@@ -169,7 +189,13 @@ impl<'a> Sdp<'a> {
         fmtp
     }
 
+    /// Flattens parsed fmtp parameters back into the name/value pairs Jingle
+    /// carries as `<parameter>` children.
+    ///
+    /// The SDP crate models well-known parameters as typed fields, so each has
+    /// to be named explicitly here; booleans go back out as `1`/`0`.
     fn fmtp_to_params(&self, fmtp: &SdpAttributeFmtpParameters) -> Vec<(String, String)> {
+        /// Renders a flag the way fmtp expects.
         fn b(v: bool) -> &'static str {
             if v { "1" } else { "0" }
         }
@@ -292,6 +318,10 @@ impl<'a> Sdp<'a> {
         params
     }
 
+    /// Adds the m-line's RTCP feedback attributes to a payload-type element.
+    ///
+    /// `trr-int` has its own element name in Jingle; everything else is a
+    /// `type`/`subtype` pair.
     fn rtcp_fb_to_jingle(&self, media: &SdpMedia, stanza: &mut Stanza) -> Result<(), Error> {
         let rtcp_fbs: Vec<SdpAttributeRtcpFb> = media
             .get_attributes_of_type(SdpAttributeType::Rtcpfb)
@@ -328,6 +358,8 @@ impl<'a> Sdp<'a> {
 
         Ok(())
     }
+    /// Fills a `<transport>` with the DTLS fingerprint, setup role, ICE
+    /// credentials and local candidates for one m-line.
     fn transport_to_jingle(&self, media: &SdpMedia, stanza: &mut Stanza) -> Result<(), Error> {
         let fingerprints: Vec<SdpAttributeFingerprint> = media
             .get_attributes_of_type(SdpAttributeType::Fingerprint)
@@ -398,6 +430,7 @@ impl<'a> Sdp<'a> {
         Ok(())
     }
 
+    /// Formats a fingerprint as the uppercase colon-separated hex Jingle uses.
     fn fingerprint_to_hex(&self, fp: &[u8]) -> String {
         let hx = fp
             .iter()
@@ -408,6 +441,7 @@ impl<'a> Sdp<'a> {
         hx
     }
 
+    /// Writes one ICE candidate's attributes onto a `<candidate>` element.
     fn parse_candidate(
         &self,
         candidate_stanza: &mut Stanza,

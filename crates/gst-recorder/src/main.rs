@@ -1,3 +1,9 @@
+//! Recorder binary: an HTTP control surface in front of the XMPP client.
+//!
+//! One process holds a single XMPP connection (run on its own thread) and any
+//! number of meetings. `GET /?room=<name>` makes the recorder join a room;
+//! recording then proceeds on its own and stops when the meeting ends.
+
 use config::{Config, ConfigError};
 use gst_meet::{config::ConfigSettings, room_manager::RoomManager, xmpp::App};
 use libstrophe::Stanza;
@@ -10,6 +16,11 @@ use std::{
 };
 use tiny_http::{Request, Response, Server};
 
+/// Loads config, starts GStreamer and the XMPP thread, then serves join
+/// requests until the listener stops.
+///
+/// Each request is handled on its own thread and answers as soon as the join
+/// presence is queued — not when the room is actually recording.
 fn main() {
     let config = init_config().expect("failed to initialize config");
     let config = Arc::new(config);
@@ -73,6 +84,11 @@ fn main() {
     }
 }
 
+/// Loads `config/default.toml`, overlays `config/<RUN_MODE>.toml` and any
+/// `APP_*` environment variables, and installs the logger.
+///
+/// Paths are relative to the workspace root, so the binary must be run from
+/// there.
 fn init_config() -> Result<ConfigSettings, ConfigError> {
     let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
 
@@ -94,6 +110,8 @@ fn init_config() -> Result<ConfigSettings, ConfigError> {
     Ok(settings)
 }
 
+/// Pulls the room name out of the `room=` query parameter, falling back to
+/// `"unknown_room"`.
 fn parse_room(request: &Request, _config: &Arc<ConfigSettings>) -> String {
     let url = request.url();
 

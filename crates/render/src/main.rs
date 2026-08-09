@@ -1,3 +1,14 @@
+//! Render service: turns a recorded meeting into a single composited video.
+//!
+//! `GET /?room=<name>` reads `recordings/<room>/timeline.json`, cuts the
+//! meeting into segments where the layout is constant, resolves each segment
+//! into clips over the per-participant recordings, and renders the result with
+//! GStreamer Editing Services.
+//!
+//! The pipeline is: [`timeline`] (what happened) → [`layout`] (what should be
+//! on screen when) → [`clip`] (which file and which part of it) →
+//! [`renderer`] (the GES timeline and the encode).
+
 use std::{fs, path::Path, thread};
 
 use gstreamer::{Caps, ClockTime, MessageView, State};
@@ -17,6 +28,8 @@ mod layout;
 mod renderer;
 mod timeline;
 
+/// Hardcoded GES smoke test kept for debugging the encoder settings; not
+/// wired into the service.
 fn _ges_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Timeline with one audio + one video track
     let timeline = ges::Timeline::new_audio_video();
@@ -92,6 +105,7 @@ fn _ges_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 type Result<T> = std::result::Result<T, RenderError>;
 
+/// Failures while locating or loading a recorded meeting.
 #[derive(Debug, thiserror::Error)]
 enum RenderError {
     #[error("io error: {0}")]
@@ -101,6 +115,7 @@ enum RenderError {
     TimelineError(#[from] TimelineError),
 }
 
+/// Pulls the room name out of the `room=` query parameter.
 fn parse_room(request: &Request) -> String {
     let url = request.url();
 
@@ -113,6 +128,7 @@ fn parse_room(request: &Request) -> String {
     "unknown_room".to_string()
 }
 
+/// Loads the recorded timeline for a room.
 fn process_request(room_name: &str) -> Result<Timeline> {
     warn!("found this room: {}", room_name);
     let format_path = format!("recordings/{}/timeline.json", room_name);
@@ -121,6 +137,10 @@ fn process_request(room_name: &str) -> Result<Timeline> {
     Ok(timeline)
 }
 
+/// Serves render requests, one thread per request.
+///
+/// The response is sent only after the render finishes, so a request to this
+/// service blocks for roughly the length of the encode.
 fn main() {
     env_logger::init();
 

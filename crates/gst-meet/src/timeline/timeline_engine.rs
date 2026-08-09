@@ -1,3 +1,5 @@
+//! Background collector that turns timeline events into the JSON artifacts.
+
 use std::{
     collections::HashMap,
     sync::mpsc::{self, Receiver},
@@ -13,12 +15,17 @@ use crate::timeline::{
     timeline_process::write_file,
 };
 
+/// Owns the meeting clock and, once spawned, the thread that accumulates
+/// timeline events and writes them out.
 pub struct TimelineEngine {
     pub output_path: String,
+    /// Monotonic zero point; every event timestamp is an offset from here.
     pub start_instant: Instant,
+    /// Wall-clock start, in epoch milliseconds, for `metadata.json`.
     pub start_timestamp: u128,
 }
 
+/// Wall-clock now, in epoch milliseconds.
 fn now_unix() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,6 +34,8 @@ fn now_unix() -> u128 {
 }
 
 impl TimelineEngine {
+    /// Starts the meeting clock. Call this at the moment the room is created,
+    /// since every later timestamp is relative to it.
     pub fn new(output_path: String) -> Self {
         Self {
             output_path,
@@ -35,6 +44,12 @@ impl TimelineEngine {
         }
     }
 
+    /// Spawns the collector thread and returns the handle the room posts
+    /// events to.
+    ///
+    /// The thread lives until it sees [`TimelineEvent::MeetingEnd`], then
+    /// writes both JSON files and signals the handle — which is what
+    /// [`TimelineHandler::wait_for_files`] waits on during drain.
     pub fn spawn(
         output_path: String,
         room: String,
@@ -57,6 +72,8 @@ impl TimelineEngine {
 
         TimelineHandler::new(tx, start_instant, files_written_rx)
     }
+    /// Collector loop: drains the event channel until the meeting ends, then
+    /// writes `metadata.json` and `timeline.json`.
     fn run(
         rx: Receiver<TimelineEvent>,
         files_written_tx: mpsc::Sender<()>,
@@ -100,6 +117,9 @@ impl TimelineEngine {
         let _ = files_written_tx.send(());
     }
 
+    /// Writes one output file, logging rather than propagating failure — the
+    /// thread is finishing either way and the room only learns whether files
+    /// appeared.
     fn generate_output_files(path: &str, content: impl Serialize) {
         match write_file(path, content) {
             Ok(()) => {
@@ -111,6 +131,8 @@ impl TimelineEngine {
         }
     }
 
+    /// Appends an event to the timeline, and registers the participant in the
+    /// metadata roster when it is a join.
     fn parse_event(
         event: TimelineEvent,
         events: &mut Vec<Timeline>,

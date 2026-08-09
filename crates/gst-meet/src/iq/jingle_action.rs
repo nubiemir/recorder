@@ -1,3 +1,5 @@
+//! Jingle actions, and the Jingle-to-SDP conversion behind `session-initiate`.
+
 use std::fmt::Display;
 
 use chrono::Utc;
@@ -17,6 +19,8 @@ use crate::{
     util::{find_all, find_first},
 };
 
+/// A Jingle action the recorder acts on, holding the `<jingle>` stanza it came
+/// from. Actions we don't implement never become a value of this type.
 #[derive(Debug)]
 pub enum JingleAction<'a> {
     SessionInitiate(&'a Stanza),
@@ -24,14 +28,19 @@ pub enum JingleAction<'a> {
     SourceRemove(&'a Stanza),
 }
 
+/// One stream announced by the bridge, resolved from Jitsi's JSON source
+/// encoding.
 pub struct ParsedSource {
     pub ssrc: u32,
+    /// Endpoint that owns the stream.
     pub endpoint_id: String,
+    /// Jitsi source name, `<endpoint>-v0` / `-a0` / `-v1`.
     pub source_name: String,
     pub video_type: Option<String>, // Some("d") => screenshare video; None for audio/camera
 }
 
 impl<'a> JingleAction<'a> {
+    /// Recognizes an action name, or `None` for actions we ignore.
     pub(crate) fn parse(s: &str, stanza: &'a Stanza) -> Option<Self> {
         match s {
             "session-initiate" => Some(Self::SessionInitiate(stanza)),
@@ -41,6 +50,12 @@ impl<'a> JingleAction<'a> {
         }
     }
 
+    /// Translates a `session-initiate` into the SDP offer handed to
+    /// `webrtcbin`, or an empty string if the result won't parse as SDP.
+    ///
+    /// Built in three passes: the session header, then one m-line per Jingle
+    /// `<content>`, then [`final_parsing`](Self::final_parsing) to split and
+    /// renumber m-lines the way the WebRTC stack expects.
     pub fn handle_session_initiate(&self, stanza: &Stanza, media: &mut JingleMedia) -> String {
         let mut sdp_session = self.parse_sdp_session(stanza);
         let mut sdp_media = String::from("");
@@ -66,6 +81,16 @@ impl<'a> JingleAction<'a> {
         final_sdp
     }
 
+    /// Extracts the SSRC-to-source mapping from a `source-add`.
+    ///
+    /// Sources arrive as a `<json-message>` keyed by endpoint, whose value is
+    /// `[video, ssrc_groups, audio]`. Two kinds of entry are skipped: the
+    /// bridge's own `jvb*` endpoint, and RTX retransmission SSRCs, which show
+    /// up as the second member of an `"f"` (FID) group and carry no media of
+    /// their own.
+    ///
+    /// Video is walked before audio so that a downstream sibling lookup finds
+    /// the video source already registered at the same index.
     pub fn handle_source_add(&self, stanza: &Stanza) -> Vec<ParsedSource> {
         let mut res = vec![];
 
@@ -143,11 +168,16 @@ impl<'a> JingleAction<'a> {
         res
     }
 
+    /// Logs a `source-remove`. Not acted on: a removed source stops producing
+    /// RTP, and the branch recording it is finalized on participant-left or at
+    /// meeting end.
     pub fn handle_source_remove(&self, stanza: &Stanza) -> String {
         info!("source removed: {}", stanza.to_string());
         String::new()
     }
 
+    /// Builds the SDP session header (`v=`, `o=`, `s=`, `t=`), adding
+    /// `a=cryptex` when the bridge advertises it on any fingerprint.
     fn parse_sdp_session(&self, stanza: &Stanza) -> String {
         let mut sdp = String::new();
         let session_id = Utc::now().timestamp_millis();
@@ -169,6 +199,17 @@ impl<'a> JingleAction<'a> {
         sdp
     }
 
+    /// Reshapes the Jingle-derived SDP into an offer `webrtcbin` accepts.
+    ///
+    /// Jingle packs every SSRC for a media type onto one `<content>`, but
+    /// WebRTC wants one m-line per stream (unified plan). So each m-line is
+    /// split: one copy per primary SSRC, each with a fresh `mid`, carrying its
+    /// own FID group and the RTX SSRC paired with it. The first copy stays
+    /// `sendrecv` (it is the transceiver we answer on); the rest become
+    /// `sendonly`.
+    ///
+    /// Finally it re-attaches a BUNDLE group over the new mids and rebuilds
+    /// `a=msid-semantic` from the msids that survived.
     fn final_parsing(
         &self,
         sdp: &str,

@@ -1,7 +1,14 @@
+//! Reads the recorder's `timeline.json` and turns its event log into intervals.
+//!
+//! The recorder writes discrete events ("camera_on at 12.4s"); layout needs
+//! spans ("camera on from 12.4s to 40.1s"). This module pairs on/off events
+//! into intervals, closing anything still open at the end of the meeting.
+
 use serde::Deserialize;
 use std::{collections::HashMap, fs::File};
 use thiserror::Error;
 
+/// Failures while reading or interpreting a `timeline.json`.
 #[derive(Debug, Error)]
 pub enum TimelineError {
     #[error("io error: {0}")]
@@ -17,6 +24,8 @@ pub enum TimelineError {
 type Result<T> = std::result::Result<T, TimelineError>;
 type Participants = HashMap<String, Participant>;
 
+/// One participant's presence and device intervals, in seconds from the start
+/// of the meeting. Each `(start, end)` pair is a span the device was live.
 #[derive(Debug, Default)]
 pub struct Participant {
     pub joined: f64,
@@ -26,6 +35,7 @@ pub struct Participant {
     pub audio: Vec<(f64, f64)>,
 }
 
+/// A stretch of time during which one participant was the dominant speaker.
 #[derive(Debug)]
 pub struct Dominant {
     pub start: f64,
@@ -34,13 +44,17 @@ pub struct Dominant {
     pub nickname: String,
 }
 
+/// The whole meeting in interval form: who was present when, and who was
+/// speaking.
 #[derive(Debug)]
 pub struct Timeline {
     pub participants: Participants,
     pub dominant: Vec<Dominant>,
+    /// Meeting length in seconds; every interval is clamped to this.
     pub end: f64,
 }
 
+/// One entry as it appears in `timeline.json`.
 #[derive(Debug, Deserialize)]
 pub struct RawEvent {
     pub event: String,
@@ -50,6 +64,7 @@ pub struct RawEvent {
 }
 
 impl Timeline {
+    /// Loads and interprets a `timeline.json`.
     pub fn load_timeline(path: &str) -> Result<Timeline> {
         let events = Self::read_file(path)?;
         let end = Self::calculate_end(&events)?;
@@ -65,6 +80,11 @@ impl Timeline {
         Ok(events)
     }
 
+    /// Meeting length, taken from the `meeting_ended` event.
+    ///
+    /// Its absence is an error rather than a fallback to the last event: a
+    /// timeline without it came from a recording that never drained, and
+    /// rendering it would silently truncate.
     fn calculate_end(events: &Vec<RawEvent>) -> Result<f64> {
         const MEETING_ENDED: &str = "meeting_ended";
         let end = events
@@ -76,6 +96,15 @@ impl Timeline {
         Ok(end)
     }
 
+    /// Folds the event log into intervals.
+    ///
+    /// `open_*` maps hold the start of each device span still waiting for its
+    /// "off" event; leaving, or the end of the meeting, closes whatever is
+    /// still open. Dominant speaker works the same way: each `dominant` event
+    /// for a different participant closes the previous speaker's span.
+    ///
+    /// Events with no participant id accumulate under the empty key, which is
+    /// discarded at the end.
     fn process_events(events: Vec<RawEvent>, end: f64) -> Timeline {
         let mut participants: Participants = HashMap::new();
 
@@ -191,12 +220,16 @@ impl Timeline {
 }
 
 impl Participant {
+    /// Whether they were in the meeting at `t` seconds. Intervals are
+    /// half-open, so the instant they leave already counts as absent.
     pub fn present_at(&self, t: f64) -> bool {
         self.joined <= t && t < self.left
     }
+    /// Whether their camera was live at `t` seconds.
     pub fn camera_on_at(&self, t: f64) -> bool {
         self.camera.iter().any(|&(s, e)| s <= t && t < e)
     }
+    /// Whether they were screensharing at `t` seconds.
     pub fn sharing_at(&self, t: f64) -> bool {
         self.share.iter().any(|&(s, e)| s <= t && t < e)
     }

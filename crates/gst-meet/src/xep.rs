@@ -1,17 +1,39 @@
+//! XMPP protocol namespaces, kept in one place so stanza builders never spell
+//! a URN by hand.
+
 use std::fmt;
 
+/// A namespace URN used in the Jingle stanzas this client exchanges with the
+/// focus and the bridge. [`Display`](fmt::Display) yields the URN itself, so
+/// these go straight into `xmlns` attributes.
 pub enum XEP {
+    /// XEP-0338 grouping, i.e. BUNDLE.
     BundleMedia,
+    /// XEP-0320 DTLS-SRTP key exchange.
     DtlsSrtp,
+    /// XEP-0176 ICE-UDP transport.
     IceUdpTransport,
+    /// XEP-0166 Jingle itself.
     Jingle,
+    /// XEP-0327 Rayo, used by Jitsi for call control.
     Rayo,
+    /// XEP-0167 audio content type.
     RtpAudio,
+    /// XEP-0293 RTCP feedback negotiation.
     RtpFeedback,
+    /// XEP-0294 RTP header extensions.
     RtpHeaderExtensions,
+    /// XEP-0167 RTP sessions.
     RtpMedia,
+    /// XEP-0167 video content type.
     RtpVideo,
+    /// SCTP data channel transport.
+    ///
+    /// NOTE: currently resolves to the same URN as [`XEP::RtpMedia`]
+    /// (`urn:xmpp:jingle:apps:rtp:1`), which is almost certainly wrong —
+    /// the SCTP transport is `urn:xmpp:jingle:transports:dtls-sctp:1`.
     SctpDataChannel,
+    /// XEP-0339 source-specific media attributes (`ssrc` / `ssrc-group`).
     SourceAttributes,
 }
 

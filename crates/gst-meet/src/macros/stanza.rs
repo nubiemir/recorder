@@ -1,3 +1,16 @@
+//! Declarative construction and reading of libstrophe stanzas.
+
+/// Builds a [`Stanza`](libstrophe::Stanza) from a name, optional attributes and
+/// optional children, evaluating to `Result<Stanza, libstrophe::Error>`.
+///
+/// ```ignore
+/// let iq = make_stanza!("iq", { "type" => "set", "to" => jid }, [jingle])?;
+/// let ping = make_stanza!("ping", { "xmlns" => XEP::Jingle.to_string() })?;
+/// let wrap = make_stanza!("content", [description, transport])?;
+/// ```
+///
+/// The body expands inside an immediately-invoked closure so `?` short-circuits
+/// on the first failing `set_attribute` / `add_child`.
 #[macro_export]
 macro_rules! make_stanza {
     ($name:expr, {
@@ -60,6 +73,12 @@ macro_rules! make_stanza {
     }};
 }
 
+/// Sets several attributes on an existing stanza, evaluating to
+/// `Result<(), libstrophe::Error>`.
+///
+/// ```ignore
+/// set_attribute!(stanza, { "xmlns" => ns, "senders" => "both" })?;
+/// ```
 #[macro_export]
 macro_rules! set_attribute {
     ($stanza:expr, {
@@ -78,6 +97,17 @@ macro_rules! set_attribute {
     };
 }
 
+/// Reads attributes off a stanza into an ad-hoc struct with one `String` field
+/// per attribute; missing attributes come back empty rather than erroring.
+///
+/// ```ignore
+/// let fields = get_attribute!(stanza, [from, to, id]);       // field == attribute
+/// let fields = get_attribute!(stanza, { sid => "sid",        // field != attribute
+///                                       initiator => "initiator" });
+/// ```
+///
+/// The struct type is declared inside the expansion, so it exists only for the
+/// expression it is used in.
 #[macro_export]
 macro_rules! get_attribute{
     ($stanza:expr, [$($field:ident),+]) => {{

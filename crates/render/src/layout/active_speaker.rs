@@ -1,3 +1,6 @@
+//! Speaker-focused layout: one large tile, with a corner thumbnail while
+//! someone is screensharing.
+
 use crate::{
     layout::{
         Layout, OUT_HEIGHT, OUT_WIDTH, Placement, Rect, Source, dominant, present, source_for,
@@ -5,13 +8,18 @@ use crate::{
     timeline::Timeline,
 };
 
+/// Size of the corner thumbnail shown over a screenshare.
 const THUMB_WIDTH: i32 = 320;
 const THUMB_HEIGHT: i32 = 180;
 
+/// Shows the dominant speaker full-frame; if anyone is screensharing, the
+/// share takes the frame and the speaker moves to a bottom-right thumbnail.
 #[derive(Debug, Default)]
 pub(crate) struct ActiveSpeaker;
 
 impl Layout for ActiveSpeaker {
+    /// Returns no placements when nobody is present, or when no dominant
+    /// speaker is known — a segment with no placements is skipped entirely.
     fn placements_at(&self, tl: &Timeline, time_sec: f64) -> Vec<Placement> {
         let present = present(tl, time_sec);
 

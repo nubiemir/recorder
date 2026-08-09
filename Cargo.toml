@@ -6,7 +6,7 @@ members = [
   "crates/gst-recorder", "crates/render",
 ]
 
-default-members =  ["crates/render"]
+default-members =  ["crates/gst-recorder"]
 
 [workspace.package]
 version = "0.1.0"
