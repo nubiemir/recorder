@@ -1,26 +1,42 @@
+//! A single meeting: its WebRTC connection, its GStreamer pipeline, and the
+//! recordings running inside it.
+//!
+//! [`Room`] is an `Arc` handle so the same room can be reached from the XMPP
+//! thread, GStreamer's callbacks, and its own bus-watcher thread; callbacks
+//! hold a [`RoomWeak`] so a finished room can still be dropped. All mutable
+//! state sits behind mutexes on [`RoomInner`].
+//!
+//! # Recording lifecycle
+//!
+//! Jingle announces which SSRC belongs to which participant source, then
+//! `webrtcbin` produces a pad per SSRC. A pad that arrives before its
+//! announcement is blocked and parked until [`Room::handle_register_ssrc`]
+//! can route it. Once routed, the pad gets a
+//! [`Branch`] that writes one file.
+//!
+//! Teardown is EOS-driven, because a muxer only writes its index when it sees
+//! EOS: [`Room::on_meeting_terminated`] detaches every branch and posts a
+//! drain message, the bus watcher removes each branch as its EOS arrives, and
+//! only then is the pipeline stopped and the timeline flushed.
+
 use crate::{
     avatar::generate_avatar,
     config::Webrtc,
     get_attribute,
     iq::{Iq, jingle_action::ParsedSource},
     make_stanza,
+    participant::{Participant, branch::Branch},
     sdp::Sdp,
-    timeline::{
-        timeline_engine::TimelineEngine,
-        timeline_handler::{SourceEntry, TimelineHandler},
-    },
+    timeline::{timeline_engine::TimelineEngine, timeline_handler::TimelineHandler},
     upgrade_weak,
+    util::dir_builder,
     xep::XEP,
 };
 use gstreamer::{
-    Bin, Bus, ClockTime, Element, ElementFactory, GhostPad, MessageView, Pad, PadDirection,
-    PadLinkError, PadProbeReturn, PadProbeType, Pipeline, Promise, PromiseError, State,
-    StateChangeError, Structure, StructureRef,
-    event::Eos,
-    glib::{
-        BoolError, Value,
-        object::{Cast, ObjectExt},
-    },
+    Bus, ClockTime, Element, ElementFactory, MessageView, Pad, PadDirection, PadLinkError,
+    PadProbeReturn, PadProbeType, Pipeline, Promise, PromiseError, State, StateChangeError,
+    Structure, StructureRef,
+    glib::{BoolError, Value, object::ObjectExt},
     message::Application,
     prelude::{
         ElementExt, ElementExtManual, GObjectExtManualGst, GstBinExt, GstBinExtManual,
@@ -35,7 +51,6 @@ use nanoid::nanoid;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs::DirBuilder,
     process::exit,
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -51,6 +66,11 @@ use webrtc_sdp::{
     parse_sdp,
 };
 
+/// Messages the JVB sends over the Colibri data channel.
+///
+/// Only dominant-speaker changes are acted on; anything else deserializes to
+/// [`ColibriMessage::Unknown`] so an unfamiliar message is ignored rather than
+/// failing the parse.
 #[derive(Deserialize)]
 #[serde(tag = "colibriClass")]
 #[allow(unused)]
@@ -69,6 +89,7 @@ enum ColibriMessage {
     Unknown,
 }
 
+/// Failures while attaching a recording branch to a new `webrtcbin` pad.
 #[derive(Debug, Error)]
 pub enum IncomingStreamError {
     #[error("missing caps")]
@@ -105,23 +126,6 @@ const TIMELINE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_MESSAGE: &str = "room-draining";
 
 #[derive(Debug)]
-struct Media {
-    audio_muted: bool,
-    video_muted: bool,
-    screenshare_muted: bool,
-    avatare_generated: bool,
-}
-
-#[derive(Debug)]
-struct Branch {
-    bin: Bin,
-    src_pad: Pad,
-    entry_pad: Pad,
-    filesink: Element,
-    finalizing: bool,
-}
-
-#[derive(Debug)]
 #[allow(unused)]
 pub struct RoomInner {
     pub name: String,
@@ -131,15 +135,20 @@ pub struct RoomInner {
     ufrag: OnceLock<String>,
     pwd: OnceLock<String>,
     timeline_handler: TimelineHandler,
-    participant_media: Mutex<HashMap<String, Media>>,
-    branches: Mutex<HashMap<String, Branch>>,
+    /// Everything scoped to one endpoint — media state, sources, recordings.
+    participants: Mutex<HashMap<String, Participant>>,
+    /// Pads that arrived before their SSRC was announced, so we don't yet know
+    /// which participant owns them. Keyed by ssrc, blocked until routed.
     pending_pads: Mutex<HashMap<u32, (Pad, gstreamer::PadProbeId)>>,
     draining: AtomicBool,
 }
 
+/// Weak handle held by GStreamer callbacks, which outlive the room.
 #[derive(Debug)]
 pub struct RoomWeak(Weak<RoomInner>);
 
+/// Shared handle to a meeting. Cloning is cheap and every clone refers to the
+/// same [`RoomInner`].
 #[derive(Debug, Clone)]
 pub struct Room(Arc<RoomInner>);
 
@@ -158,6 +167,8 @@ impl std::fmt::Display for Room {
 }
 
 impl Drop for RoomInner {
+    /// Stops the pipeline when the last handle goes away — a backstop for
+    /// rooms that never drained normally.
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(State::Null);
     }
@@ -170,21 +181,24 @@ impl RoomWeak {
 }
 
 impl Room {
+    /// Weak handle for use inside GStreamer callbacks.
     pub fn downgrade(&self) -> RoomWeak {
         RoomWeak(Arc::downgrade(&self.0))
     }
 
+    /// Creates the room, its output directory, its pipeline, and the threads
+    /// that serve them.
+    ///
+    /// The pipeline goes to Playing asynchronously and the bus watcher and
+    /// timeline collector start immediately, so the room is ready before the
+    /// first Jingle stanza arrives. A failure to reach Playing is fatal and
+    /// exits the process.
     pub fn new(name: String, tx: Sender<Stanza>, webrtc: &Webrtc) -> Result<Self, BoolError> {
         let pipeline = Pipeline::new();
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
 
         let output_path = format!("recordings/{}", name);
-        match DirBuilder::new().recursive(true).create(&output_path) {
-            Err(err) => {
-                error!("failed to create directory for: {name} err: {err:?} room");
-            }
-            _ => {}
-        }
+        dir_builder(&output_path);
 
         webrtcbin.set_property_from_str("stun-server", &webrtc.stun_server);
         webrtcbin.set_property_from_str("bundle-policy", &webrtc.bundle_policy);
@@ -214,8 +228,7 @@ impl Room {
             webrtcbin,
             pipeline: pipeline.clone(),
             tx,
-            participant_media: Mutex::new(HashMap::new()),
-            branches: Mutex::new(HashMap::new()),
+            participants: Mutex::new(HashMap::new()),
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),
             timeline_handler: timeline_handler,
@@ -237,6 +250,8 @@ impl Room {
         Ok(room)
     }
 
+    /// Starts the timeline collector and returns the handle events are posted
+    /// to. This also sets the meeting's time zero.
     fn initialize_timeline(room_name: &str, output_path: &str) -> TimelineHandler {
         let timeline_engine = TimelineEngine::new(output_path.to_string());
         TimelineEngine::spawn(
@@ -247,6 +262,12 @@ impl Room {
         )
     }
 
+    /// Starts recording a newly added `webrtcbin` pad.
+    ///
+    /// Called from the `pad-added` signal and again from
+    /// [`Room::handle_register_ssrc`] when a parked pad is released. Non-RTP
+    /// pads and pads arriving during drain are ignored; a pad whose SSRC has
+    /// no owner yet is parked rather than dropped.
     pub fn on_incoming_stream(&self, pad: &Pad) -> Result<(), IncomingStreamError> {
         if pad.direction() != PadDirection::Src {
             return Ok(());
@@ -272,116 +293,64 @@ impl Room {
         let ssrc = structure.get::<u32>("ssrc").unwrap_or(0);
         let encoding = structure.get::<String>("encoding-name").unwrap_or_default();
 
-        let endpoint = match self.timeline_handler.endpoint_for_ssrc(ssrc) {
-            Some(e) => e,
-            None => {
-                warn!(
-                    "no endpoint mapping for ssrc={} yet, parking pad until registered",
-                    ssrc
-                );
-                if let Some(probe_id) = pad
-                    .add_probe(gstreamer::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
-                        gstreamer::PadProbeReturn::Ok
-                    })
-                {
-                    self.pending_pads
-                        .lock()
-                        .unwrap()
-                        .insert(ssrc, (pad.clone(), probe_id));
-                } else {
-                    warn!("couldn't get probe id for ssrc={}", ssrc);
-                }
-                return Ok(());
-            }
+        let mut participants = self.participants.lock().unwrap();
+
+        // The SSRC is the only thing the pad tells us; the owning participant
+        // is whoever announced it over Jingle.
+        let owner = participants
+            .iter()
+            .find(|(_, participant)| participant.source_for_ssrc(ssrc).is_some())
+            .map(|(endpoint_id, _)| endpoint_id.clone());
+
+        let Some(endpoint_id) = owner else {
+            drop(participants);
+            self.park_pad(ssrc, pad);
+            return Ok(());
         };
 
-        let key = format!("{}-{}", endpoint.endpoint, endpoint.kind);
+        let participant = participants
+            .get_mut(&endpoint_id)
+            .expect("owner was just looked up");
+        let source = participant
+            .source_for_ssrc(ssrc)
+            .expect("owner was matched on this ssrc")
+            .clone();
 
-        let (bin, entry_pad, filesink, path) = self.build_branch(&ssrc, &encoding, &endpoint)?;
+        let branch = Branch::build(ssrc, pad.clone(), &encoding, &source, &self.name)?;
+        self.pipeline.add(&branch.bin)?;
+        branch.bin.sync_state_with_parent()?;
+        pad.link(&branch.entry_pad)?;
 
-        self.pipeline.add(&bin)?;
-        bin.sync_state_with_parent()?;
-        pad.link(&entry_pad)?;
+        info!("recording {encoding} (ssrc={ssrc}) -> {}", &branch.path);
+        participant.add_branch(ssrc, branch);
 
-        info!("recording {encoding} (ssrc={ssrc}) -> {}", path);
-        self.branches.lock().unwrap().insert(
-            key,
-            Branch {
-                bin,
-                src_pad: pad.clone(),
-                entry_pad,
-                filesink,
-                finalizing: false,
-            },
-        );
         Ok(())
     }
 
-    fn build_branch(
-        &self,
-        ssrc: &u32,
-        encoding: &str,
-        endpoint: &SourceEntry,
-    ) -> Result<(Bin, Pad, Element, String), BoolError> {
-        let bin = Bin::builder()
-            .name(format!("branch_{}", ssrc))
-            .property("message-forward", true)
-            .build();
+    /// Blocks a pad whose SSRC has not been announced yet and holds it until
+    /// `handle_register_ssrc` can route it to a participant.
+    fn park_pad(&self, ssrc: u32, pad: &Pad) {
+        warn!("no source mapping for ssrc={ssrc} yet, parking pad until registered");
 
-        let queue = ElementFactory::make("queue")
-            .name(format!("queue_{}", ssrc))
-            .build()?;
-
-        let depay = match encoding {
-            "AV1" => ElementFactory::make("rtpav1depay").build()?,
-            "VP8" => ElementFactory::make("rtpvp8depay").build()?,
-            "VP9" => ElementFactory::make("rtpvp9depay").build()?,
-            "H264" => ElementFactory::make("rtph264depay").build()?,
-            "OPUS" => ElementFactory::make("rtpopusdepay").build()?,
-            _ => unreachable!(),
-        };
-
-        let parse = match encoding {
-            "AV1" => Some(ElementFactory::make("av1parse").build()?),
-            "H264" => Some(ElementFactory::make("h264parse").build()?),
-            "OPUS" => Some(ElementFactory::make("opusparse").build()?),
-            _ => None,
-        };
-
-        let (muxer, ext) = {
-            let muxer = ElementFactory::make("matroskamux").build()?;
-            muxer.set_property("min-index-interval", 1_000_000_000i64);
-            muxer.set_property("offset-to-zero", true);
-            (muxer, "mkv")
-        };
-
-        let filesink = ElementFactory::make("filesink").build()?;
-        let path = format!(
-            "recordings/{}/{}/{}.{}",
-            self.name,
-            endpoint.endpoint,
-            endpoint.kind.to_string(),
-            ext
-        );
-        filesink.set_property("location", &path);
-
-        bin.add_many([&queue, &depay, &muxer, &filesink])?;
-        if let Some(parse) = &parse {
-            bin.add(parse)?;
-            Element::link_many([&queue, &depay, parse, &muxer])?;
-        } else {
-            Element::link_many([&queue, &depay, &muxer])?;
+        match pad.add_probe(PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
+            PadProbeReturn::Ok
+        }) {
+            Some(probe_id) => {
+                self.pending_pads
+                    .lock()
+                    .unwrap()
+                    .insert(ssrc, (pad.clone(), probe_id));
+            }
+            None => warn!("couldn't get probe id for ssrc={ssrc}"),
         }
-        Element::link(&muxer, &filesink)?;
-
-        let queue_sink = queue.static_pad("sink").unwrap();
-        let ghost = GhostPad::with_target(&queue_sink)?;
-        ghost.set_active(true)?;
-        bin.add_pad(&ghost)?;
-
-        Ok((bin, ghost.upcast(), filesink, path))
     }
 
+    /// Sets up the Colibri data channel to the JVB.
+    ///
+    /// On open it sends receiver constraints asking for every participant
+    /// (`lastN: -1`) at up to 720p — without them the bridge forwards only a
+    /// few streams and the recording would be missing participants. Incoming
+    /// messages supply dominant-speaker changes for the timeline.
     fn on_data_channel(&self, dc: WebRTCDataChannel) {
         let room_name = self.name.clone();
         dc.connect_on_open(move |data_channel| {
@@ -443,6 +412,8 @@ impl Room {
         });
     }
 
+    /// Connects `webrtcbin`'s candidate signal to this Jingle session, so
+    /// locally gathered candidates are sent as `transport-info`.
     pub fn handle_ice_candidate(&mut self, from: &str, to: &str, sid: &str, initiator: &str) {
         let room_clone = self.downgrade();
 
@@ -477,6 +448,11 @@ impl Room {
         &self.pipeline
     }
 
+    /// Sends one locally gathered ICE candidate as a Jingle `transport-info`.
+    ///
+    /// The content name is derived from the m-line index, matching the order
+    /// the offer was built in (audio, video, data). End-of-candidates (an
+    /// empty candidate string) is not forwarded.
     fn on_ice_candidate(
         &self,
         values: &[Value],
@@ -551,6 +527,12 @@ impl Room {
         None
     }
 
+    /// Completes negotiation once `webrtcbin` has produced an answer.
+    ///
+    /// Opens the Colibri data channel, applies the answer as the local
+    /// description, and sends it back as `session-accept`. The data channel is
+    /// created here, before the local description is set, so it is part of the
+    /// same negotiation rather than triggering a renegotiation.
     fn on_answer_created(
         &self,
         from: String,
@@ -618,6 +600,10 @@ impl Room {
         }
     }
 
+    /// Converts the SDP answer to Jingle and queues the `session-accept` IQ.
+    ///
+    /// The room's ICE credentials are latched from the first answer that
+    /// carries them, since later renegotiations reuse them.
     fn parse_sdp_answer(
         &self,
         sdp_message: &SDPMessageRef,
@@ -654,6 +640,12 @@ impl Room {
         Ok(())
     }
 
+    /// Applies the offer built from `session-initiate` and asks `webrtcbin`
+    /// for an answer.
+    ///
+    /// Both steps run through promises on GStreamer's threads, so this returns
+    /// immediately; the answer continues in
+    /// `on_answer_created`.
     pub fn handle_session_initiate(
         &self,
         stanza: &Stanza,
@@ -684,172 +676,128 @@ impl Room {
         });
     }
 
+    /// Marks the start of the meeting on the timeline.
     fn on_meeting_started(&self) {
         self.timeline_handler.meeting_started();
     }
 
+    /// Whether this endpoint is already tracked, i.e. whether incoming
+    /// presence is a join or a mute update.
     pub fn endpoint_available(&self, endpoint: &str) -> bool {
-        self.participant_media
-            .lock()
-            .unwrap()
-            .contains_key(endpoint)
+        self.participants.lock().unwrap().contains_key(endpoint)
     }
 
+    /// `recordings/<room>/<endpoint>`, created on demand since every artifact
+    /// for a participant lands there.
+    fn participant_dir(&self, endpoint_id: &str) -> String {
+        let dir_path = format!("recordings/{}/{}", self.name, endpoint_id);
+        dir_builder(&dir_path);
+        dir_path
+    }
+
+    /// Renders the stand-in shown while the camera is muted, once.
+    fn ensure_avatar(&self, endpoint_id: &str, nickname: &str, participant: &mut Participant) {
+        if !participant.needs_avatar() {
+            return;
+        }
+
+        let path = format!("{}/avatar.png", self.participant_dir(endpoint_id));
+        match generate_avatar(nickname, &path) {
+            Ok(_) => {
+                info!("avatar generated for {endpoint_id} at {path}");
+                participant.media.set_avatar_generated(true);
+            }
+            Err(err) => error!("failed to generate avatar for {endpoint_id}: {err}"),
+        }
+    }
+
+    /// Registers a participant who has just joined and records the join, plus
+    /// their initial camera/audio state, on the timeline.
     pub fn on_participant_joined(
-        &mut self,
+        &self,
         endpoint_id: &str,
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
         screenshare_muted: bool,
     ) {
-        let mut par_media = self.participant_media.lock().unwrap();
+        let mut participant = Participant::new(nickname);
+        participant.update_media(audio_muted, video_muted, screenshare_muted);
+        self.ensure_avatar(endpoint_id, nickname, &mut participant);
 
-        let mut media = Media {
-            audio_muted,
-            video_muted,
-            screenshare_muted,
-            avatare_generated: false,
-        };
+        let mut participants = self.participants.lock().unwrap();
 
-        let path = format!(
-            "recordings/{}/{}/{}.{}",
-            self.name, endpoint_id, "avatar", "png"
-        );
-
-        let dir_path = format!("recordings/{}/{}", self.name, endpoint_id,);
-
-        match DirBuilder::new().recursive(true).create(&dir_path) {
-            Err(err) => {
-                error!("failed to create directory for: {} err: {err:?}", dir_path);
-            }
-            _ => {}
-        }
-
-        if video_muted {
-            match generate_avatar(nickname, &path) {
-                Ok(_) => {
-                    info!("avatar generated");
-                    media.avatare_generated = true
-                }
-                Err(err) => {
-                    error!("failed to generate avatar: {}", err);
-                }
-            }
-        }
-
-        par_media.insert(endpoint_id.to_string(), media);
+        participants.insert(endpoint_id.to_string(), participant);
 
         self.timeline_handler.participant_joined(
             Some(endpoint_id.to_string()),
             nickname.to_string(),
             video_muted,
             audio_muted,
+            participants.is_empty(),
         );
     }
 
+    /// Applies a mute update for a participant already in the room, emitting a
+    /// timeline event for each flag that actually changed.
     pub fn source_info_updated(
-        &mut self,
+        &self,
         endpoint_id: &str,
         nickname: &str,
         video_muted: bool,
         audio_muted: bool,
         screenshare_muted: bool,
     ) {
-        let mut par_media = self.participant_media.lock().unwrap();
-        let participant = par_media.get(endpoint_id);
-
-        let path = format!(
-            "recordings/{}/{}/{}.{}",
-            self.name, endpoint_id, "avatar", "png"
-        );
-
-        let dir_path = format!("recordings/{}/{}", self.name, endpoint_id,);
-
-        match DirBuilder::new().recursive(true).create(&dir_path) {
-            Err(err) => {
-                error!("failed to create directory for: {} err: {err:?}", dir_path);
-            }
-            _ => {}
-        }
-
-        if let Some(participant) = participant {
-            let mut avatar_generated = false;
-
-            if !participant.avatare_generated && video_muted {
-                match generate_avatar(nickname, &path) {
-                    Ok(_) => {
-                        info!("avatar generated");
-                        avatar_generated = true;
-                    }
-                    Err(err) => {
-                        error!("failed to generate avatar: {}", err);
-                    }
-                }
-            }
-
-            if participant.video_muted != video_muted {
-                if participant.video_muted {
-                    self.timeline_handler
-                        .camera_on(Some(endpoint_id.to_string()));
-                } else {
-                    self.timeline_handler
-                        .camera_off(Some(endpoint_id.to_string()));
-                }
-            }
-
-            if participant.audio_muted != audio_muted {
-                if participant.audio_muted {
-                    self.timeline_handler
-                        .audio_on(Some(endpoint_id.to_string()));
-                } else {
-                    self.timeline_handler
-                        .audio_off(Some(endpoint_id.to_string()));
-                }
-            }
-
-            if participant.screenshare_muted != screenshare_muted {
-                if participant.screenshare_muted {
-                    self.timeline_handler
-                        .screenshare_on(Some(endpoint_id.to_string()));
-                } else {
-                    self.timeline_handler
-                        .screenshare_off(Some(endpoint_id.to_string()));
-                }
-            }
-
-            par_media.insert(
-                endpoint_id.to_string(),
-                Media {
-                    audio_muted,
-                    video_muted,
-                    screenshare_muted,
-                    avatare_generated: avatar_generated,
-                },
+        let mut participants = self.participants.lock().unwrap();
+        let Some(participant) = participants.get_mut(endpoint_id) else {
+            warn!(
+                "source info for unknown endpoint {endpoint_id} in room {}",
+                self.name
             );
+            return;
+        };
+
+        let changes = participant.update_media(audio_muted, video_muted, screenshare_muted);
+        self.ensure_avatar(endpoint_id, nickname, participant);
+
+        let endpoint = || Some(endpoint_id.to_string());
+        match changes.video_muted {
+            Some(true) => self.timeline_handler.camera_off(endpoint()),
+            Some(false) => self.timeline_handler.camera_on(endpoint()),
+            None => {}
+        }
+        match changes.audio_muted {
+            Some(true) => self.timeline_handler.audio_off(endpoint()),
+            Some(false) => self.timeline_handler.audio_on(endpoint()),
+            None => {}
+        }
+        match changes.screenshare_muted {
+            Some(true) => self.timeline_handler.screenshare_off(endpoint()),
+            Some(false) => self.timeline_handler.screenshare_on(endpoint()),
+            None => {}
         }
     }
 
-    pub fn on_participant_left(&mut self, endpoint_id: &str) {
+    /// Records the departure and closes the files that participant was still
+    /// being recorded to.
+    pub fn on_participant_left(&self, endpoint_id: &str) {
         self.timeline_handler
             .participant_left(Some(endpoint_id.to_string()));
 
-        let prefix = format!("{endpoint_id}-");
-        let keys: Vec<String> = {
-            let branches = self.branches.lock().unwrap();
-            branches
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect()
-        };
-        for key in keys {
-            self.finalize_branch(&key);
+        // The participant stays in the map until its branches have drained;
+        // the bus watcher removes each one as its EOS arrives.
+        if let Some(participant) = self.participants.lock().unwrap().get_mut(endpoint_id) {
+            participant.finalize_branches();
         }
     }
 
     /// Starts draining the room and returns immediately; the bus watcher
     /// finishes the teardown once every recording has finalized.
+    /// Detaches every branch, then returns immediately; the bus watcher
+    /// finishes teardown once each recording has finalized.
+    ///
+    /// Guarded so a second call is a no-op — the room can be told the meeting
+    /// ended more than once.
     pub fn on_meeting_terminated(&self) {
         if self.draining.swap(true, Ordering::SeqCst) {
             return;
@@ -864,14 +812,8 @@ impl Room {
         // installed so nothing flows into an unlinked pad while draining.
         self.pending_pads.lock().unwrap().clear();
 
-        {
-            let mut branches = self.branches.lock().unwrap();
-            for (key, branch) in branches.iter_mut() {
-                if !branch.finalizing {
-                    branch.finalizing = true;
-                    self.detach_branch(key, branch);
-                }
-            }
+        for participant in self.participants.lock().unwrap().values_mut() {
+            participant.finalize_branches();
         }
 
         match self.pipeline.bus() {
@@ -882,19 +824,25 @@ impl Room {
         }
     }
 
+    /// Records what an SSRC carries and, if a pad for it was parked, starts
+    /// recording that pad now.
+    ///
+    /// The parked pad's block probe is removed only after the branch is
+    /// attached, so no buffer escapes into an unlinked pad.
     pub fn handle_register_ssrc(&self, parsed_source: ParsedSource) {
         let ssrc = parsed_source.ssrc;
-        let output_path = format!("recordings/{}/{}", self.name, parsed_source.endpoint_id);
-        self.timeline_handler.register_ssrc(parsed_source);
+        let endpoint_id = parsed_source.endpoint_id.clone();
+        self.participant_dir(&endpoint_id);
 
-        match DirBuilder::new().recursive(true).create(&output_path) {
-            Err(err) => {
-                error!(
-                    "failed to create directory for: {} err: {err:?}",
-                    output_path
+        match self.participants.lock().unwrap().get_mut(&endpoint_id) {
+            Some(participant) => participant.register_ssrc(parsed_source),
+            None => {
+                warn!(
+                    "ssrc={ssrc} announced for unknown endpoint {endpoint_id} in room {}",
+                    self.name
                 );
+                return;
             }
-            _ => {}
         }
 
         let parked = self.pending_pads.lock().unwrap().remove(&ssrc);
@@ -911,47 +859,28 @@ impl Room {
         }
     }
 
-    fn finalize_branch(&self, source_key: &str) {
-        let mut branches = self.branches.lock().unwrap();
-        match branches.get_mut(source_key) {
-            Some(branch) if !branch.finalizing => {
-                branch.finalizing = true;
-                info!(
-                    "finalizing recording branch {source_key} in room {}",
-                    self.name
-                );
-                self.detach_branch(source_key, branch);
-            }
-            Some(_) => {}
-            None => warn!(
-                "no recording branch to finalize for {source_key} in room {}",
-                self.name
-            ),
-        }
+    /// Pulls the first branch matching `pred` out of whichever participant
+    /// owns it, so a bus message can be traced back to its recording.
+    fn take_branch(&self, pred: impl Fn(&Branch) -> bool) -> Option<Branch> {
+        self.participants
+            .lock()
+            .unwrap()
+            .values_mut()
+            .find_map(|participant| participant.take_branch(&pred))
     }
 
-    fn detach_branch(&self, key: &str, branch: &Branch) {
-        branch
-            .src_pad
-            .add_probe(PadProbeType::DATA_DOWNSTREAM, |_pad, _info| {
-                PadProbeReturn::Drop
-            });
-
-        if let Err(err) = branch.src_pad.unlink(&branch.entry_pad) {
-            warn!(
-                "failed to unlink branch {key} in room {}: {err:?}",
-                self.name
-            );
-        }
-
-        if !branch.entry_pad.send_event(Eos::new()) {
-            error!(
-                "failed to send EOS to branch {key} in room {}; file may not finalize",
-                self.name
-            );
-        }
+    fn recording_in_progress(&self) -> bool {
+        self.participants
+            .lock()
+            .unwrap()
+            .values()
+            .any(Participant::has_branches)
     }
 
+    /// Starts the bus-watcher thread.
+    ///
+    /// The thread holds a strong [`Room`], which is what keeps a room alive
+    /// after the manager drops it at meeting end, until draining finishes.
     fn spawn_bus_watcher(&self) {
         let Some(bus) = self.pipeline.bus() else {
             error!(
@@ -965,6 +894,13 @@ impl Room {
         std::thread::spawn(move || room.run_bus_watcher(bus));
     }
 
+    /// Bus loop: retires branches as their EOS arrives, and ends the room once
+    /// drain completes.
+    ///
+    /// Before drain starts it blocks on the bus indefinitely. The drain
+    /// message arms a [`FINALIZE_TIMEOUT`] deadline, after which the loop
+    /// exits even if some muxer never reported EOS — a stuck branch must not
+    /// hold the process open.
     fn run_bus_watcher(&self, bus: Bus) {
         let mut drain_deadline: Option<Instant> = None;
 
@@ -1002,7 +938,7 @@ impl Room {
                 }
             }
 
-            if drain_deadline.is_some() && self.branches.lock().unwrap().is_empty() {
+            if drain_deadline.is_some() && !self.recording_in_progress() {
                 break;
             }
         }
@@ -1010,6 +946,11 @@ impl Room {
         self.complete_drain();
     }
 
+    /// Unwraps a `GstBinForwarded` element message.
+    ///
+    /// Branch bins are built with `message-forward`, so their EOS reaches the
+    /// pipeline bus wrapped inside an element message rather than as a
+    /// pipeline-level EOS.
     fn forwarded_message(msg: &gstreamer::Message) -> Option<gstreamer::Message> {
         let structure = msg.structure()?;
         if structure.name() != "GstBinForwarded" {
@@ -1018,33 +959,18 @@ impl Room {
         structure.get::<gstreamer::Message>("message").ok()
     }
 
+    /// A branch's filesink has seen EOS, so its file is complete: remove the
+    /// branch from the pipeline.
     fn on_branch_eos(&self, src: &gstreamer::Object) {
-        let entry = {
-            let mut branches = self.branches.lock().unwrap();
-            let key = branches
-                .iter()
-                .find(|(_, branch)| branch.filesink.upcast_ref::<gstreamer::Object>() == src)
-                .map(|(key, _)| key.clone());
-            key.and_then(|key| branches.remove(&key).map(|branch| (key, branch)))
-        };
-
-        let Some((key, branch)) = entry else {
+        let Some(branch) = self.take_branch(|branch| branch.owns_filesink(src)) else {
             return;
         };
 
-        if let Err(err) = self.pipeline.remove(&branch.bin) {
-            warn!(
-                "failed to remove branch {key} from pipeline in room {}: {err:?}",
-                self.name
-            );
-        }
-
-        match branch.bin.set_state(State::Null) {
-            Ok(_) => info!("finalized recording {key} in room {}", self.name),
-            Err(err) => error!("failed to stop branch {key} in room {}: {err:?}", self.name),
-        }
+        branch.teardown(&self.pipeline);
     }
 
+    /// Tears down the branch an error came from, leaving the rest of the room
+    /// recording. Errors from outside any branch are only logged.
     fn on_bus_error(&self, err: &gstreamer::message::Error) {
         error!(
             "pipeline error in room {} from {:?}: {} ({:?})",
@@ -1058,38 +984,23 @@ impl Room {
             return;
         };
 
-        let entry = {
-            let mut branches = self.branches.lock().unwrap();
-            let key = branches
-                .iter()
-                .find(|(_, branch)| src.has_as_ancestor(&branch.bin))
-                .map(|(key, _)| key.clone());
-            key.and_then(|key| branches.remove(&key).map(|branch| (key, branch)))
-        };
-
-        if let Some((key, branch)) = entry {
+        if let Some(branch) = self.take_branch(|branch| branch.contains(&src)) {
             warn!(
-                "recording {key} in room {} failed; the file may be incomplete",
-                self.name
+                "recording {} in room {} failed; the file may be incomplete",
+                branch.path, self.name
             );
-            let _ = self.pipeline.remove(&branch.bin);
-            let _ = branch.bin.set_state(State::Null);
+            branch.teardown(&self.pipeline);
         }
     }
 
+    /// Final teardown: abandon any branch that never finalized, stop the
+    /// pipeline, and wait for the timeline files.
+    ///
+    /// Once this returns, everything under `recordings/<room>/` is ready to be
+    /// picked up by the render pass.
     fn complete_drain(&self) {
-        let leftovers: Vec<String> = self
-            .branches
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(k, _)| k)
-            .collect();
-        for key in &leftovers {
-            warn!(
-                "recording {key} in room {} did not finalize; the file may be truncated",
-                self.name
-            );
+        for participant in self.participants.lock().unwrap().values_mut() {
+            participant.abandon_branches(&self.pipeline);
         }
 
         if let Err(err) = self.pipeline.set_state(State::Null) {

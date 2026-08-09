@@ -1,3 +1,9 @@
+//! Renders the placeholder frame shown for a participant whose camera is off.
+//!
+//! The image mimics the Jitsi web UI: initials in a colored circle over a dark
+//! background, with the display name underneath. It is written once per
+//! participant and reused by the render pass for every camera-off interval.
+
 use std::{
     fs::File,
     io::{BufWriter, Write},
@@ -8,6 +14,7 @@ use regex::Regex;
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Anything that can go wrong while drawing or writing an avatar.
 #[derive(Debug, Error)]
 pub enum AvataError {
     #[error("cairo error: {0}")]
@@ -23,17 +30,22 @@ pub enum AvataError {
     FileCreate(#[from] std::io::Error),
 }
 
+/// Circle colors, matching the palette Jitsi uses for its own avatars.
 const AVATAR_COLORS: [&str; 9] = [
     "#6A50D3", "#FF9B42", "#DF486F", "#73348C", "#B23683", "#F96E57", "#4380E2", "#238561",
     "#00A8B3",
 ];
 
+/// Picks a stable color for a set of initials, so the same person always gets
+/// the same circle across meetings.
 fn avatar_color(initials: &str) -> &'static str {
     let hash: u32 = initials.chars().map(|c| c as u32).sum();
 
     AVATAR_COLORS[(hash as usize) % AVATAR_COLORS.len()]
 }
 
+/// Strips trailing bracketed suffixes from a display name, repeatedly, so
+/// `"Ada Lovelace (Guest) [mobile]"` becomes `"Ada Lovelace"`.
 fn cleanup_name(nickname: &str) -> String {
     let re = Regex::new(r"\s*[\(\[\{][^()\[\]{}]*[\)\]\}]$").expect("valid regex");
 
@@ -46,6 +58,8 @@ fn cleanup_name(nickname: &str) -> String {
     cleaned
 }
 
+/// First grapheme cluster of a word, uppercased — a cluster rather than a
+/// `char` so emoji and combining marks survive intact.
 fn first_grapheme(word: &str) -> String {
     UnicodeSegmentation::graphemes(word, true)
         .next()
@@ -53,6 +67,8 @@ fn first_grapheme(word: &str) -> String {
         .to_uppercase()
 }
 
+/// Builds the one- or two-letter monogram: first letter of the first word, plus
+/// first letter of the last word when the name has more than one.
 fn initials(name: &str) -> String {
     let words = match Regex::new(r"\s*[(\[{][^)\]}]*[)\]}]$") {
         Ok(re) => re
@@ -75,6 +91,10 @@ fn initials(name: &str) -> String {
     format!("{first}{last}")
 }
 
+/// Converts `#rrggbb` to the 0.0–1.0 components cairo expects.
+///
+/// Panics on malformed input; the only inputs are the [`AVATAR_COLORS`]
+/// literals.
 fn hex_to_rgb(hex: &str) -> (f64, f64, f64) {
     let hex = hex.trim_start_matches('#');
 
@@ -85,6 +105,10 @@ fn hex_to_rgb(hex: &str) -> (f64, f64, f64) {
     (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
 }
 
+/// Draws `nickname`'s avatar and writes it to `path` as a 1920x1080 PNG —
+/// full frame size, so the render pass can drop it straight into a tile.
+///
+/// The parent directory must already exist.
 pub fn generate_avatar(nickname: &str, path: &str) -> Result<(), AvataError> {
     const WIDTH: i32 = 1920;
     const HEIGHT: i32 = 1080;

@@ -1,28 +1,47 @@
+//! Parsing of MUC presence stanzas into room lifecycle events.
+//!
+//! Jitsi carries mute state in a `<SourceInfo>` child of presence, so the same
+//! stanza type reports both "who is here" and "what is muted"; a participant
+//! already in the room simply sends presence again when they toggle a device.
+
 use std::collections::HashMap;
 
 use libstrophe::Stanza;
 
 use crate::{get_attribute, util::find_first};
 
+/// What a presence stanza means for the room.
 #[derive(Debug, Clone)]
 pub enum PresenceLifecycle {
+    /// Available presence: either a new participant, or an update from one
+    /// already in the room (the caller distinguishes the two).
     ParticipantJoined(ParticipantPresence),
+    /// Unavailable presence: the participant left.
     ParticipantLeft(ParticipantPresence),
+    /// Unavailable presence carrying `<destroy>`: the room itself is gone, so
+    /// the recording must finish.
     MeetingTerminated(ParticipantPresence),
 }
 
+/// One participant's state as of a single presence stanza.
 #[derive(Debug, Clone)]
 pub struct ParticipantPresence {
+    /// MUC resource part, the id Jitsi uses everywhere else for this person.
     pub endpoint_id: String,
+    /// `<nick>` text; only present on available presence.
     pub display_name: Option<String>,
+    /// Real JID behind the MUC nickname, when the room is non-anonymous.
     pub real_jid: Option<String>,
     pub video_muted: bool,
     pub audio_muted: bool,
     pub screenshare_muted: bool,
+    /// Full `room@conference.domain/endpoint` JID the stanza came from.
     pub from: String,
 }
 
 impl ParticipantPresence {
+    /// Classifies a presence stanza, or returns `None` if it isn't MUC presence
+    /// we can act on (no `<x><item>`, or available presence with no `<nick>`).
     pub fn from_presence(stanza: &Stanza) -> Option<PresenceLifecycle> {
         let presence_stanza = get_attribute!(stanza, {
             name => "name",
@@ -69,6 +88,13 @@ impl ParticipantPresence {
         }
     }
 
+    /// Reads mute flags out of the `<SourceInfo>` JSON blob, returning
+    /// `(video_muted, audio_muted, screenshare_muted)`.
+    ///
+    /// Source names follow Jitsi's `<endpoint>-<kind><index>` convention:
+    /// `-v0` camera, `-a0` microphone, `-v1` screenshare. Anything missing or
+    /// unparseable is treated as muted, so a stream we can't reason about is
+    /// never assumed to be live.
     fn parse_source_info(stanza: &Stanza, endpoint_id: &str) -> (bool, bool, bool) {
         let source_info_text = match find_first(Some(stanza), "SourceInfo").and_then(|n| n.text()) {
             Some(t) => t,

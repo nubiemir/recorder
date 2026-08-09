@@ -1,14 +1,24 @@
+//! Jingle `<content>` to SDP m-line conversion.
+//!
+//! Each method emits one part of an m-line and its attributes, in the order
+//! SDP requires. The struct carries the state of the m-line currently being
+//! built, since the `m=` line itself is written before some of the values that
+//! shape it are known.
+
 use crate::{
     get_attribute,
     util::{exists, find_all, find_first},
 };
 use libstrophe::Stanza;
 
+/// The m-line under construction: media type, port, transport protocol and
+/// payload-type list.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct JingleMedia {
     pub media: String,
     pub port: String,
     pub proto: String,
+    /// Payload type numbers, in preference order.
     pub fmt: Vec<String>,
 }
 
@@ -17,6 +27,8 @@ impl JingleMedia {
         JingleMedia::default()
     }
 
+    /// Converts one Jingle `<content>` into an m-line with its transport,
+    /// codec and source attributes.
     pub(crate) fn parse_sdp_media(&mut self, stanza: &Stanza) -> String {
         let mut sdp = String::new();
 
@@ -89,6 +101,8 @@ impl JingleMedia {
         sdp
     }
 
+    /// Emits ICE credentials, the DTLS fingerprint and candidate lines from a
+    /// Jingle `<transport>`.
     fn parse_transport(&mut self, stanza: &Stanza) -> String {
         let mut sdp = String::new();
         let transport_stanza = get_attribute!(stanza, [ufrag, pwd]);
@@ -113,6 +127,7 @@ impl JingleMedia {
         sdp
     }
 
+    /// Emits `a=candidate:` lines for the bridge's ICE candidates.
     fn parse_candidate(&mut self, stanza: &Stanza) -> String {
         let mut sdp = String::new();
         sdp.push_str("a=candidate:");
@@ -171,6 +186,11 @@ impl JingleMedia {
         sdp
     }
 
+    /// Emits everything under `<description>`: payload types, header
+    /// extensions, and the `a=ssrc` / `a=ssrc-group` lines.
+    ///
+    /// Bridge-owned sources are written before participant sources, since the
+    /// first SSRC on an m-line is the one the transceiver is answered on.
     fn parse_description(&mut self, stanza: &Stanza, mid: &str) -> String {
         let mut sdp = String::new();
         find_all(Some(&stanza), "payload-type")
@@ -288,6 +308,8 @@ impl JingleMedia {
         self.media = attr.to_string();
     }
 
+    /// Port field of the m-line: `0` marks the content rejected, `9` is the
+    /// discard port used when the real port comes from ICE.
     fn set_port(&mut self, attr: &str) {
         if !attr.is_empty() && attr == "rejected" {
             self.port = '0'.to_string();
@@ -296,6 +318,7 @@ impl JingleMedia {
         }
     }
 
+    /// Transport protocol: SCTP for the data channel, otherwise DTLS-SRTP.
     fn set_proto(&mut self, fingerprint_exist: bool, sctp: Option<&Stanza>) {
         if fingerprint_exist {
             match sctp {
@@ -311,6 +334,9 @@ impl JingleMedia {
         }
     }
 
+    /// Maps Jingle `senders` to an SDP direction attribute. Direction is
+    /// stated from the initiator's point of view, so `initiator` (they send)
+    /// becomes `recvonly` for us.
     fn set_senders(&self, stanza: &Stanza, sdp: &mut String) {
         let content_stanza = get_attribute!(stanza, [senders]);
         match content_stanza.senders.as_str() {
@@ -322,6 +348,8 @@ impl JingleMedia {
         }
     }
 
+    /// Emits `a=rtpmap:` for one payload type, appending the channel count
+    /// only when it is not the default of 1.
     fn parse_rtp_map(&self, stanza: &Stanza) -> String {
         let mut sdp = String::new();
 
@@ -345,6 +373,8 @@ impl JingleMedia {
         sdp
     }
 
+    /// Emits the `a=rtcp-fb:` lines for one payload type, `attr` being the
+    /// payload number (or `*`).
     fn parse_rtcp_fb(&self, payload: &Stanza, attr: &str) -> String {
         let mut sdp = String::new();
         let fb_ele_trr_int = find_first(Some(payload), "rtcp-fb-trr-int");
@@ -371,6 +401,12 @@ impl JingleMedia {
         sdp
     }
 
+    /// Ensures a video msid names both a stream and a track.
+    ///
+    /// Jitsi sends video msids with only the stream id, which leaves the track
+    /// ambiguous once one m-line is split into several. Audio msids are
+    /// already well-formed and pass through untouched, as does any msid that
+    /// already has both parts.
     pub fn adjust_msid_semantic(&self, msid: &str, idx: &str) -> String {
         if self.media == "audio" {
             return msid.to_string();

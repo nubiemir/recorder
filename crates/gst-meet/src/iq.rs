@@ -1,3 +1,11 @@
+//! IQ handling: Jingle session negotiation and service discovery.
+//!
+//! The focus drives the call over Jingle IQs. This module answers them: it
+//! converts `session-initiate` into an SDP offer for `webrtcbin` (through
+//! `jingle_media` and [`crate::sdp`]), records the SSRC-to-source mapping
+//! from `source-add`, and replies to disco#info with the feature set that makes
+//! Jitsi treat the recorder as a full participant.
+
 pub(crate) mod jingle_action;
 pub(crate) mod jingle_media;
 
@@ -16,17 +24,22 @@ use log::{error, info};
 use nanoid::nanoid;
 use webrtc_sdp::{address::Address, attribute_type::SdpAttributeCandidate, parse_sdp};
 
+/// One incoming IQ stanza, plus the media state built while answering it.
 #[derive(Debug, Clone)]
 #[allow(unused)]
 pub struct Iq {
     pub id: String,
     pub from: String,
     pub to: String,
+    /// IQ type: `get`, `set`, `result` or `error`.
     pub kind: String,
+    /// Codec and header-extension state accumulated from the Jingle
+    /// description, used to build the SDP offer.
     jingle_media: JingleMedia,
 }
 
 impl Iq {
+    /// Reads the routing attributes off an IQ stanza.
     pub fn new(stanza: &Stanza) -> Self {
         let iq_stanza = get_attribute!(stanza, {
             from => "from",
@@ -46,6 +59,8 @@ impl Iq {
         }
     }
 
+    /// Wires the room's ICE candidates to this Jingle session, so candidates
+    /// gathered by `webrtcbin` are sent as `transport-info` for the right sid.
     pub fn initialize_meeting(&self, room_manager: Rooms, sid: String, initiator: String) {
         let room_name = self.from.split('@').next().unwrap_or_default();
 
@@ -62,6 +77,11 @@ impl Iq {
         }
     }
 
+    /// Dispatches a `<jingle>` payload by action.
+    ///
+    /// `session-initiate` is converted to an SDP offer and handed to the
+    /// room's `webrtcbin`; `source-add` registers new SSRCs (which may release
+    /// pads the room has parked). Every handled action is acked.
     pub fn handle_jingle(&mut self, stanza: &Stanza, room_manager: Rooms, tx: Sender<Stanza>) {
         let jingle_stanza = get_attribute!(stanza, [sid, initiator, action]);
         let room_name = self.from.split('@').next().unwrap_or_default();
@@ -158,6 +178,7 @@ impl Iq {
         }
     }
 
+    /// Queues the empty `type="result"` reply that acknowledges this IQ.
     pub fn handle_ack(&self, tx: Sender<Stanza>) -> Result<(), Box<dyn std::error::Error>> {
         let iq_stanza = make_stanza!("iq", {
             "id" => &self.id,
@@ -171,6 +192,11 @@ impl Iq {
         Ok(())
     }
 
+    /// Answers a disco#info query with the recorder's identity and features.
+    ///
+    /// The advertised feature list is what makes Jitsi negotiate the modern
+    /// stack with us — JSON-encoded sources, source names, and multiple video
+    /// streams. Non-disco queries are ignored.
     pub fn handle_query(&self, stanza: &Stanza, tx: Sender<Stanza>) -> Result<(), Error> {
         let is_disco_info = stanza.name() == Some("query")
             && stanza.ns() == Some("http://jabber.org/protocol/disco#info");
@@ -206,6 +232,7 @@ impl Iq {
             "urn:xmpp:jingle:apps:rtp:video",
             "http://jitsi.org/json-encoded-sources",
             "http://jitsi.org/source-name",
+            "https://jitsi.org/meet/e2ee",
             "http://jitsi.org/receive-multiple-video-streams",
             "urn:ietf:rfc:4588",
         ];
@@ -246,6 +273,8 @@ impl Iq {
         Ok(())
     }
 
+    /// Converts an SDP ICE candidate into the Jingle `<candidate>` element
+    /// carried in `transport-info`.
     pub fn parse_candidate(candidate: &SdpAttributeCandidate) -> Result<Stanza, Error> {
         let mut candidate_stanza = make_stanza!("candidate", {
             "port" => candidate.port.to_string(),

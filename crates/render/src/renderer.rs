@@ -1,3 +1,10 @@
+//! Building and encoding the GES timeline.
+//!
+//! [`Renderer::build`] assembles clips into a GES timeline (one GES layer per
+//! clip layer, so compositing order is preserved) and [`Renderer::render`]
+//! encodes it to `output.mp4` in offline mode — as fast as the machine allows
+//! rather than in real time.
+
 use std::{fs, ops::Deref, path::Path};
 
 use gstreamer::{
@@ -19,6 +26,7 @@ use crate::{
     layout::{OUT_HEIGHT, OUT_WIDTH},
 };
 
+/// Failures while assembling or encoding the output.
 #[derive(Debug, Error)]
 pub enum RendererError {
     #[error("gst bool error: {0}")]
@@ -36,6 +44,7 @@ pub enum RendererError {
 
 type Result<T> = std::result::Result<T, RendererError>;
 
+/// A fully assembled GES timeline, ready to encode.
 pub(crate) struct Renderer(ges::Timeline);
 
 impl Deref for Renderer {
@@ -46,6 +55,11 @@ impl Deref for Renderer {
 }
 
 impl Renderer {
+    /// Encodes the timeline to `<out_uri>/output.mp4` as H.264 + AAC in an
+    /// MP4 container, blocking until EOS or the first error.
+    ///
+    /// `out_uri` is a directory path, not a URI; the file is created first so
+    /// it can be canonicalized into one.
     pub fn render(&self, out_uri: &str) -> Result<()> {
         let video = EncodingVideoProfile::builder(&Caps::builder("video/x-h264").build()).build();
 
@@ -94,6 +108,11 @@ impl Renderer {
         Ok(())
     }
 
+    /// Assembles clips into a GES timeline.
+    ///
+    /// The video track gets restriction caps at the output size and 30fps, so
+    /// every source is scaled to the same frame regardless of what it was
+    /// recorded at. One GES layer is created per distinct clip layer.
     pub fn build(clips: &[Clip]) -> Result<Self> {
         let timeline = ges::Timeline::new_audio_video();
 
@@ -120,14 +139,23 @@ impl Renderer {
         Ok(Renderer(timeline))
     }
 
+    /// Appends `count` layers; index 0 is the topmost in GES compositing.
     fn layers(timeline: &ges::Timeline, count: u32) -> Vec<ges::Layer> {
         (0..count).map(|_| timeline.append_layer()).collect()
     }
 
+    /// Seconds to GStreamer time.
     fn secs(t: f64) -> ClockTime {
         ClockTime::from_seconds_f64(t)
     }
 
+    /// Adds one clip to its layer, with position and size where applicable.
+    ///
+    /// Video and audio clips are restricted to their own track type so a
+    /// recording that happens to hold both doesn't contribute the one we
+    /// didn't ask for. Placement properties must be set after `add_clip`,
+    /// since the child elements they address only exist once the clip is in a
+    /// layer.
     fn add_clip(layers: &[ges::Layer], c: &Clip) -> Result<()> {
         let layer = &layers[c.layer as usize];
         let secs = Self::secs;

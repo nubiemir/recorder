@@ -1,7 +1,7 @@
-use log::{info, warn};
+//! The room's end of the timeline channel: one method per recordable event.
+
 use serde::Serialize;
 use std::{
-    collections::HashMap,
     fmt::Display,
     sync::{
         Mutex,
@@ -10,8 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::iq::jingle_action::ParsedSource;
-
+/// Something worth recording about the meeting.
+///
+/// `timestamp_ms` is always relative to the room's start, and `endpoint` is
+/// `None` for meeting-wide events. [`Display`] yields the string written into
+/// `timeline.json`.
 #[derive(Debug, Serialize)]
 pub enum TimelineEvent {
     MeetingStart {
@@ -79,35 +82,18 @@ impl Display for TimelineEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SourceKind {
-    CameraVideo,
-    Audio,
-    ScreenshareVideo,
-}
-
-impl Display for SourceKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CameraVideo => write!(f, "camera_video"),
-            Self::Audio => write!(f, "audio"),
-            Self::ScreenshareVideo => write!(f, "screenshare_video"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SourceEntry {
-    pub endpoint: String,
-    pub kind: SourceKind,
-}
-
+/// Non-blocking sink for timeline events, held by the room.
+///
+/// Every method stamps the current offset and posts to the collector thread;
+/// send failures are ignored, since a dead collector must not take the
+/// recording down with it. The `Mutex` around the receiver exists only to make
+/// the handler `Sync` — the room is shared across the XMPP, GStreamer and bus
+/// threads.
 #[derive(Debug)]
 pub(crate) struct TimelineHandler {
     tx: Sender<TimelineEvent>,
     start_instant: Instant,
     files_written_rx: Mutex<Receiver<()>>,
-    pub ssrc_map: Mutex<HashMap<u32, SourceEntry>>,
 }
 
 impl TimelineHandler {
@@ -120,7 +106,6 @@ impl TimelineHandler {
             tx,
             start_instant: instant,
             files_written_rx: Mutex::new(files_written_rx),
-            ssrc_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -134,6 +119,7 @@ impl TimelineHandler {
             .is_ok()
     }
 
+    /// Milliseconds since the room started.
     fn get_relative_ms(&self) -> u128 {
         self.start_instant.elapsed().as_millis()
     }
@@ -145,14 +131,18 @@ impl TimelineHandler {
         });
     }
 
+    /// Records a join, plus a camera/audio "on" event at the same instant for
+    /// whichever devices are already live — so the render pass sees an
+    /// explicit start for every interval rather than inferring one.
     pub fn participant_joined(
         &self,
         endpoint: Option<String>,
         nickname: String,
         video_muted: bool,
         audio_muted: bool,
+        is_empty: bool,
     ) {
-        let timestamp = self.get_relative_ms();
+        let timestamp = if is_empty { 0 } else { self.get_relative_ms() };
         let _ = self.tx.send(TimelineEvent::Joined {
             timestamp_ms: timestamp,
             endpoint: endpoint.clone(),
@@ -223,6 +213,8 @@ impl TimelineHandler {
         });
     }
 
+    /// Records a dominant-speaker change, as reported by the JVB over the
+    /// Colibri data channel.
     pub fn dominant_change(&self, endpoint: Option<String>) {
         let _ = self.tx.send(TimelineEvent::Dominant {
             timestamp_ms: self.get_relative_ms(),
@@ -230,64 +222,11 @@ impl TimelineHandler {
         });
     }
 
+    /// Final event: tells the collector thread to write its files and exit.
     pub fn meeting_ended(&self) {
         let _ = self.tx.send(TimelineEvent::MeetingEnd {
             timestamp_ms: self.get_relative_ms(),
             endpoint: None,
         });
-    }
-
-    /// "c8ef68f5-v1" -> ('v', 1), "eee01355-a0" -> ('a', 0)
-    fn parse_source_name(&self, name: &str) -> Option<(char, u32)> {
-        let suffix = name.rsplit('-').next()?; // "v1"
-        let mut chars = suffix.chars();
-        let letter = chars.next()?; // 'v' or 'a'
-        let idx: u32 = chars.as_str().parse().ok()?; // 0, 1, ...
-        Some((letter, idx))
-    }
-
-    pub fn register_ssrc(&self, parsed_source: ParsedSource) {
-        let (letter, index) = match self.parse_source_name(&parsed_source.source_name) {
-            Some(v) => v,
-            None => {
-                warn!(
-                    "register_ssrc: unparseable source name {}, skipping",
-                    parsed_source.source_name
-                );
-                return;
-            }
-        };
-
-        let kind = match letter {
-            'v' => {
-                if parsed_source.video_type == Some("d".to_string()) {
-                    SourceKind::ScreenshareVideo
-                } else {
-                    SourceKind::CameraVideo
-                }
-            }
-            'a' => SourceKind::Audio,
-            _ => {
-                warn!("unexpected source letter in {}", parsed_source.source_name);
-                return;
-            }
-        };
-
-        info!(
-            "register_ssrc: ssrc={} endpoint={} name={} index={} kind={:?}",
-            parsed_source.ssrc, parsed_source.endpoint_id, parsed_source.source_name, index, kind
-        );
-
-        self.ssrc_map.lock().unwrap().insert(
-            parsed_source.ssrc,
-            SourceEntry {
-                endpoint: parsed_source.endpoint_id,
-                kind,
-            },
-        );
-    }
-
-    pub fn endpoint_for_ssrc(&self, ssrc: u32) -> Option<SourceEntry> {
-        self.ssrc_map.lock().unwrap().get(&ssrc).cloned()
     }
 }
