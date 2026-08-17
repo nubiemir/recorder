@@ -1376,8 +1376,6 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libstrophe"
 version = "0.20.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f19303f875ed41f08adde68402d66a4c256fc9cd675ea203c96cb2364b055c08"
 dependencies = [
  "bitflags 2.13.1",
  "libstrophe-sys-bindgen",

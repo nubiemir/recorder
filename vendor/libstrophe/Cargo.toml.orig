@@ -1,0 +1,43 @@
+[package]
+name = "libstrophe"
+version = "0.20.3"
+edition = "2024"
+rust-version = "1.85.0"
+description = "Rust ergonomic wrapper for libstrophe"
+keywords = ["jabber", "xmpp", "libstrophe", "messaging", "im"]
+categories = ["api-bindings", "network-programming"]
+authors = ["Pro <twisted.fall@gmail.com>"]
+license = "LGPL-3.0"
+documentation = "https://docs.rs/libstrophe"
+repository = "https://github.com/twistedfall/libstrophe"
+exclude = ["/.github", "/ci", "/tools", ".gitignore", "release.toml", "rustfmt.toml"]
+
+[badges]
+maintenance = { status = "passively-maintained" }
+
+[workspace]
+members = ["libstrophe-sys-bindgen"]
+
+[dependencies]
+bitflags = "2"
+log = { version = "0.4", optional = true }
+num-traits = "0.2"
+once_cell = "1"
+scopeguard = "1"
+sys = { package = "libstrophe-sys-bindgen", version = "8", path = "libstrophe-sys-bindgen" }
+
+[dev-dependencies]
+env_logger = "0.11"
+names = "0.14"
+trybuild = "1"
+
+[features]
+default = ["rust-log", "libstrophe-0_14"]
+buildtime_bindgen = ["sys/buildtime_bindgen"]
+libstrophe-0_9_3 = []
+libstrophe-0_10_0 = ["libstrophe-0_9_3"]
+libstrophe-0_11_0 = ["libstrophe-0_10_0"]
+libstrophe-0_12_0 = ["libstrophe-0_11_0"]
+libstrophe-0_13 = ["libstrophe-0_12_0"]
+libstrophe-0_14 = ["libstrophe-0_13"]
+rust-log = ["log"]

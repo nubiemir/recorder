@@ -1,134 +1,69 @@
-//! Parsing of MUC presence stanzas into room lifecycle events.
-//!
-//! Jitsi carries mute state in a `<SourceInfo>` child of presence, so the same
-//! stanza type reports both "who is here" and "what is muted"; a participant
-//! already in the room simply sends presence again when they toggle a device.
-
-use std::collections::HashMap;
-
+use crate::{
+    e2ee::olm_adapter::OlmAdapter, make_stanza, util::username_generator::generate_username,
+};
 use libstrophe::Stanza;
+use nanoid::nanoid;
+use thiserror::Error;
 
-use crate::{get_attribute, util::find_first};
+pub mod participant_presence;
 
-/// What a presence stanza means for the room.
-#[derive(Debug, Clone)]
-pub enum PresenceLifecycle {
-    /// Available presence: either a new participant, or an update from one
-    /// already in the room (the caller distinguishes the two).
-    ParticipantJoined(ParticipantPresence),
-    /// Unavailable presence: the participant left.
-    ParticipantLeft(ParticipantPresence),
-    /// Unavailable presence carrying `<destroy>`: the room itself is gone, so
-    /// the recording must finish.
-    MeetingTerminated(ParticipantPresence),
+#[derive(Error, Debug)]
+pub enum PresenceError {
+    #[error("failed to parse stanza err: {0}")]
+    ParseError(#[from] libstrophe::Error),
 }
 
-/// One participant's state as of a single presence stanza.
-#[derive(Debug, Clone)]
-pub struct ParticipantPresence {
-    /// MUC resource part, the id Jitsi uses everywhere else for this person.
-    pub endpoint_id: String,
-    /// `<nick>` text; only present on available presence.
-    pub display_name: Option<String>,
-    /// Real JID behind the MUC nickname, when the room is non-anonymous.
-    pub real_jid: Option<String>,
-    pub video_muted: bool,
-    pub audio_muted: bool,
-    pub screenshare_muted: bool,
-    /// Full `room@conference.domain/endpoint` JID the stanza came from.
-    pub from: String,
+#[derive(Debug)]
+#[allow(unused)]
+pub struct Presence {
+    stats_id: String,
+    curve25519: String,
+    ed25519: String,
+    codec_list: [&'static str; 4],
+    e2ee_enabled: bool,
 }
 
-impl ParticipantPresence {
-    /// Classifies a presence stanza, or returns `None` if it isn't MUC presence
-    /// we can act on (no `<x><item>`, or available presence with no `<nick>`).
-    pub fn from_presence(stanza: &Stanza) -> Option<PresenceLifecycle> {
-        let presence_stanza = get_attribute!(stanza, {
-            name => "name",
-            from => "from",
-            kind => "type"
-        });
-
-        let endpoint_id = presence_stanza.from.rsplit('/').next()?.to_string();
-
-        let item_stanza = find_first(Some(&stanza), "x>item")?;
-
-        let real_jid = get_attribute!(item_stanza, [jid]).jid;
-
-        let real_jid = if real_jid.is_empty() {
-            None
-        } else {
-            Some(real_jid)
-        };
-
-        let (video_muted, audio_muted, screenshare_muted) =
-            Self::parse_source_info(stanza, &endpoint_id);
-
-        let mut participant = Self {
-            endpoint_id,
-            display_name: None,
-            real_jid,
-            from: presence_stanza.from,
-            video_muted,
-            audio_muted,
-            screenshare_muted,
-        };
-
-        if presence_stanza.kind.is_empty() {
-            let display_name = find_first(Some(&stanza), "nick")?.text();
-            participant.display_name = display_name;
-            return Some(PresenceLifecycle::ParticipantJoined(participant));
-        } else {
-            let destroy_stanza = find_first(Some(&stanza), "x>destroy");
-
-            match destroy_stanza {
-                Some(_) => return Some(PresenceLifecycle::MeetingTerminated(participant)),
-                None => return Some(PresenceLifecycle::ParticipantLeft(participant)),
-            }
+impl Presence {
+    fn new() -> Self {
+        let olm_adapter = OlmAdapter::new();
+        let id_keys = olm_adapter.get_id_keys();
+        Self {
+            stats_id: generate_username(),
+            curve25519: id_keys.curve25519.to_string(),
+            ed25519: id_keys.ed25519.to_string(),
+            codec_list: ["h264", "vp8", "vp9", "av1"],
+            e2ee_enabled: false,
         }
     }
 
-    /// Reads mute flags out of the `<SourceInfo>` JSON blob, returning
-    /// `(video_muted, audio_muted, screenshare_muted)`.
-    ///
-    /// Source names follow Jitsi's `<endpoint>-<kind><index>` convention:
-    /// `-v0` camera, `-a0` microphone, `-v1` screenshare. Anything missing or
-    /// unparseable is treated as muted, so a stream we can't reason about is
-    /// never assumed to be live.
-    fn parse_source_info(stanza: &Stanza, endpoint_id: &str) -> (bool, bool, bool) {
-        let source_info_text = match find_first(Some(stanza), "SourceInfo").and_then(|n| n.text()) {
-            Some(t) => t,
-            None => return (true, true, false),
-        };
+    pub fn handle_join_recorder(room: &str) -> Result<(Stanza, Presence), PresenceError> {
+        let recorder_presence = Self::new();
 
-        let video_key = format!("{}-v0", endpoint_id);
-        let audio_key = format!("{}-a0", endpoint_id);
-        let screen_key = format!("{}-v1", endpoint_id);
+        let stats = make_stanza!("stats-id", {}, text: &recorder_presence.stats_id)?;
 
-        let map: HashMap<String, serde_json::Value> = match serde_json::from_str(&source_info_text)
-        {
-            Ok(m) => m,
-            Err(_) => return (true, true, false),
-        };
+        let codecs = recorder_presence.codec_list.join(",");
+        let codec_list = make_stanza!("jitsi_participant_codecList", {}, text: codecs)?;
 
-        let video_muted = map
-            .get(&video_key)
-            .and_then(|v| v.get("muted"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let curve25519 = make_stanza!(
+            "jitsi_participant_e2ee.idKey.curve25519",
+            {},
+            text: &recorder_presence.curve25519
+        )?;
 
-        let screenshare_muted = map
-            .get(&screen_key)
-            .and_then(|v| v.get("muted"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let ed25519 = make_stanza!(
+            "jitsi_participant_e2ee.idKey.ed25519",
+            {},
+            text: &recorder_presence.ed25519
+        )?;
 
-        let audio_muted = map
-            .get(&audio_key)
-            .and_then(|v| v.get("muted"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let x = make_stanza!("x", {
+            "xmlns" => "http://jabber.org/protocol/muc"
+        })?;
 
-        (video_muted, audio_muted, screenshare_muted)
+        let presence = make_stanza!("presence", {
+            "to" => format!("{}@muc.meet.jitsi/{}", room, nanoid!(10))
+        }, [stats, codec_list, curve25519, ed25519, x])?;
+
+        Ok((presence, recorder_presence))
     }
 }

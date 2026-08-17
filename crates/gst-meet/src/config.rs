@@ -63,18 +63,16 @@ impl ConfigSettings {
         config.try_deserialize()
     }
 
-    /// Installs the global logger. Call once at startup; `env_logger` panics if
-    /// a logger is already set.
-    ///
-    /// NOTE: the `info` filter is parsed unconditionally *after* the `debug`
-    /// one, and each `parse_filters` call replaces the previous filter — so
-    /// `debug = true` currently has no effect.
+    /// Installs the global logger at `debug` or `info` depending on the
+    /// `debug` setting. Call once at startup; `env_logger` panics if a logger
+    /// is already set.
     pub fn logger_init(&self) {
         let mut builder = Builder::new();
         if self.debug {
             builder.parse_filters(&LogLevel::Debug.to_string());
+        } else {
+            builder.parse_filters(&LogLevel::Info.to_string());
         }
-        builder.parse_filters(&LogLevel::Info.to_string());
         builder.init();
     }
 }

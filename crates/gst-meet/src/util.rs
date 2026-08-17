@@ -5,6 +5,8 @@ use std::fs::DirBuilder;
 use libstrophe::Stanza;
 use log::error;
 
+pub mod username_generator;
+
 /// Collects every descendant matching `selector`, a `>`-separated path such as
 /// `"jingle>content>description"`.
 ///

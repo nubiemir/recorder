@@ -26,6 +26,7 @@ use crate::{
     iq::{Iq, jingle_action::ParsedSource},
     make_stanza,
     participant::{Participant, branch::Branch},
+    presence::Presence,
     sdp::Sdp,
     timeline::{timeline_engine::TimelineEngine, timeline_handler::TimelineHandler},
     upgrade_weak,
@@ -134,6 +135,7 @@ pub struct RoomInner {
     tx: Sender<Stanza>,
     ufrag: OnceLock<String>,
     pwd: OnceLock<String>,
+    recorder: Presence,
     timeline_handler: TimelineHandler,
     /// Everything scoped to one endpoint — media state, sources, recordings.
     participants: Mutex<HashMap<String, Participant>>,
@@ -193,7 +195,12 @@ impl Room {
     /// timeline collector start immediately, so the room is ready before the
     /// first Jingle stanza arrives. A failure to reach Playing is fatal and
     /// exits the process.
-    pub fn new(name: String, tx: Sender<Stanza>, webrtc: &Webrtc) -> Result<Self, BoolError> {
+    pub fn new(
+        name: String,
+        tx: Sender<Stanza>,
+        webrtc: &Webrtc,
+        presence: Presence,
+    ) -> Result<Self, BoolError> {
         let pipeline = Pipeline::new();
         let webrtcbin = ElementFactory::make("webrtcbin").build()?;
 
@@ -228,6 +235,7 @@ impl Room {
             webrtcbin,
             pipeline: pipeline.clone(),
             tx,
+            recorder: presence,
             participants: Mutex::new(HashMap::new()),
             ufrag: OnceLock::new(),
             pwd: OnceLock::new(),

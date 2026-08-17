@@ -1,3 +1,5 @@
+use std::fmt;
+
 use vodozemac::olm::{Account, IdentityKeys};
 
 /// The recorder's Olm identity for E2EE key exchange.
@@ -11,13 +13,24 @@ pub struct OlmAdapter {
     olm_account: Account,
 }
 
+impl fmt::Debug for OlmAdapter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OlmAdapter")
+            .field("olm_account", &"<redacted>")
+            .finish()
+    }
+}
+
 impl OlmAdapter {
     /// Generates a new, ephemeral identity.
     pub fn new() -> Self {
         let account = Account::new();
-        Self {
+        let olm_adapter = Self {
             olm_account: account,
-        }
+        };
+        olm_adapter.on_idkeys_ready();
+
+        olm_adapter
     }
 
     /// The *public* identity keys, which are what gets published to other
@@ -25,4 +38,6 @@ impl OlmAdapter {
     pub fn get_id_keys(&self) -> IdentityKeys {
         self.olm_account.identity_keys()
     }
+
+    fn on_idkeys_ready(&self) {}
 }

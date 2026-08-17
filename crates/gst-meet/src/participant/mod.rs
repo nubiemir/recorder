@@ -7,6 +7,7 @@
 //! bus; per-endpoint bookkeeping lives here.
 
 use crate::{
+    e2ee::E2EE,
     iq::jingle_action::ParsedSource,
     participant::{
         branch::Branch,
@@ -43,6 +44,7 @@ pub struct Participant {
     pub e2ee_enabled: bool,
     pub nickname: String,
     pub media: Media,
+    pub e2ee: E2EE,
     pub branches: HashMap<u32, Branch>,   // ssrc, Branch
     pub ssrcs: HashMap<u32, SourceEntry>, // ssrc, SourceEntry
 }
@@ -61,6 +63,7 @@ impl Participant {
     pub fn new(nickname: &str) -> Self {
         Self {
             e2ee_enabled: false,
+            e2ee: E2EE::new(),
             nickname: nickname.to_string(),
             media: Media::new(),
             branches: HashMap::new(),

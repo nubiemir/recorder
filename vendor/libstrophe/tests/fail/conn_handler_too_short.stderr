@@ -1,0 +1,27 @@
+warning: unused import: `StreamError`
+ --> src/tests/fail/conn_handler_too_short.rs:1:56
+  |
+1 | use libstrophe::{Connection, ConnectionEvent, Context, StreamError};
+  |                                                        ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+error[E0597]: `handler` does not live long enough
+ --> src/tests/fail/conn_handler_too_short.rs:7:35
+  |
+6 |         let handler = |_: &Context, _: &mut Connection, _: ConnectionEvent| {};
+  |             ------- binding `handler` declared here
+7 |         conn.connect_client(None, None, &handler).unwrap()
+  |         --------------------------------^^^^^^^^----------
+  |         |                               |
+  |         |                               borrowed value does not live long enough
+  |         a temporary with access to the borrow is created here ...
+8 |     };
+  |     -- ... and the borrow might be used here, when that temporary is dropped and runs the `Drop` code for type `libstrophe::Context`
+  |     |
+  |     `handler` dropped here while still borrowed
+  |
+help: consider adding semicolon after the expression so its temporaries are dropped sooner, before the local variables declared by the block are dropped
+  |
+7 |         conn.connect_client(None, None, &handler).unwrap();
+  |                                                           +

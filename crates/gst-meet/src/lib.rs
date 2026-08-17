@@ -25,6 +25,7 @@ pub mod config;
 pub mod e2ee;
 pub mod iq;
 pub mod macros;
+pub mod message;
 pub mod participant;
 pub mod presence;
 pub mod room;

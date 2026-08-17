@@ -1,9 +1,14 @@
 //! Routes presence events to the right [`Room`], creating and retiring rooms
 //! as meetings start and end.
 
+use gstreamer::glib::BoolError;
 use libstrophe::Stanza;
 
-use crate::{config::Webrtc, presence::ParticipantPresence, room::Room};
+use crate::{
+    config::Webrtc,
+    presence::{Presence, participant_presence::ParticipantPresence},
+    room::Room,
+};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, mpsc::Sender},
@@ -42,6 +47,25 @@ impl RoomManager {
         self.rooms.contains_key(name)
     }
 
+    /// Creates the room and its pipeline ahead of joining, so the presence
+    /// reply and the Jingle offer that follow have something to land on.
+    ///
+    /// Idempotent: joining a room the recorder is already in is a no-op.
+    pub fn handle_join_room(
+        &mut self,
+        name: &str,
+        tx: Sender<Stanza>,
+        webrtc: &Webrtc,
+        presence: Presence,
+    ) -> Result<(), BoolError> {
+        if !self.contains_key(name) {
+            let room = Room::new(name.to_string(), tx, webrtc, presence)?;
+            self.insert(room);
+        }
+
+        Ok(())
+    }
+
     /// Handles available presence, creating the room (and its pipeline) on the
     /// first participant seen.
     ///
@@ -51,15 +75,8 @@ impl RoomManager {
     pub fn on_participant_joined(
         &mut self,
         name: &str,
-        tx: Sender<Stanza>,
-        webrtc: &Webrtc,
         participant: ParticipantPresence,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.contains_key(name) {
-            let room = Room::new(name.to_string(), tx.clone(), &webrtc)?;
-            self.insert(room);
-        }
-
         if let Some(room) = self.get_mut(name) {
             if !room.endpoint_available(&participant.endpoint_id) {
                 room.on_participant_joined(

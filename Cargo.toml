@@ -35,3 +35,12 @@ thiserror = "2.0.18"
 nanoid = "0.5.0"
 serde_json = "1.0.149"
 serde = {version = "1.0.228", features = ["derive"]}
+
+# Local fix for a null-pointer realloc in libstrophe 0.20.3's allocator shim.
+# C defines realloc(NULL, n) as malloc(n) and expat depends on that, but the
+# crate forwards the null straight to Rust's alloc::realloc, which forbids it.
+# Rust 1.97's std routes realloc through NonNull::new_unchecked, so the debug
+# precondition check now aborts the process at startup. Drop this patch once
+# upstream (https://github.com/twistedfall/libstrophe) ships a fix.
+[patch.crates-io]
+libstrophe = { path = "vendor/libstrophe" }

@@ -5,13 +5,12 @@
 //! are queued on an mpsc channel that a timed handler flushes on the
 //! connection thread — libstrophe's connection is not `Sync`, so the room
 //! threads can never touch it directly.
-
+use gstreamer::glib::BoolError;
 use libstrophe::{
     ConnectClientError, Connection, ConnectionEvent, ConnectionFlags, Context, HandlerResult,
     Stanza,
 };
 use log::{debug, error, info};
-use nanoid::nanoid;
 use std::{
     sync::{
         Arc, Mutex,
@@ -24,9 +23,11 @@ use thiserror::Error;
 use crate::{
     config::{ConfigSettings, Webrtc},
     iq::Iq,
-    make_stanza,
-    presence::{ParticipantPresence, PresenceLifecycle},
-    room_manager::{RoomManager, Rooms},
+    presence::{
+        Presence, PresenceError,
+        participant_presence::{ParticipantPresence, PresenceLifecycle},
+    },
+    room_manager::Rooms,
 };
 
 /// Failures from connecting to XMPP or building and queueing stanzas.
@@ -38,12 +39,16 @@ pub enum AppError {
     #[error("failed to connect: {0:?}")]
     ConnectClientError(ConnectClientError<'static, 'static>),
 
-    #[error("failed to parse stanza for room '{room}': {source}")]
-    ParseError {
+    #[error("presence error: {0}")]
+    PresenceError(#[from] PresenceError),
+
+    #[error("failed to create room '{room}': {source}")]
+    RoomCreationError {
         room: String,
         #[source]
-        source: libstrophe::Error,
+        source: BoolError,
     },
+
     #[error("failed to send stanza for room '{room}': {source:?}")]
     SendError {
         room: String,
@@ -61,13 +66,15 @@ pub enum AppError {
 pub struct App {
     xmpp_context: Context<'static, 'static>,
     tx: Sender<Stanza>,
+    rm: Rooms,
 }
 
 impl App {
-    fn new(context: Context<'static, 'static>, tx: Sender<Stanza>) -> Self {
+    fn new(context: Context<'static, 'static>, tx: Sender<Stanza>, rm: Rooms) -> Self {
         App {
             xmpp_context: context,
             tx,
+            rm,
         }
     }
 
@@ -98,14 +105,11 @@ impl App {
     /// flushes the outgoing stanza queue, and the presence and IQ handlers.
     /// Disconnect stops the context, which ends [`App::xmpp_run`].
     fn xmpp_connection_handler(
-        webrtc: Webrtc,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
-        room_manager: RoomManager,
+        room_manager: Rooms,
     ) -> impl FnMut(&libstrophe::Context, &mut Connection, ConnectionEvent) + Send {
         let rx_shared = Arc::new(Mutex::new(rx));
-        let webrtc = Arc::new(webrtc);
-        let room_manager = Arc::new(Mutex::new(room_manager));
         move |ctx, conn, evt| match evt {
             ConnectionEvent::Connect => {
                 info!("XMPP connected");
@@ -123,9 +127,15 @@ impl App {
                 );
 
                 conn.handler_add(
-                    Self::handle_presence(room_manager.clone(), tx.clone(), webrtc.clone()),
+                    Self::handle_presence(room_manager.clone()),
                     None,
                     Some("presence"),
+                    None,
+                );
+                conn.handler_add(
+                    Self::handle_message(room_manager.clone(), tx.clone()),
+                    None,
+                    Some("message"),
                     None,
                 );
                 conn.handler_add(
@@ -180,11 +190,9 @@ impl App {
     /// manager. The room name is the local part of the sender's JID.
     fn handle_presence(
         room_manager: Rooms,
-        tx: Sender<Stanza>,
-        webrtc: Arc<Webrtc>,
     ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
         move |_ctx, _conn, stanza| {
-            debug!("presence stanza received: {}", stanza.to_string());
+            error!("presence stanza received: {}", stanza.to_string());
             if let Some(p_life_cycle) = ParticipantPresence::from_presence(stanza) {
                 match p_life_cycle {
                     PresenceLifecycle::ParticipantJoined(participant) => {
@@ -197,8 +205,7 @@ impl App {
 
                         let mut rm = room_manager.lock().unwrap();
 
-                        match rm.on_participant_joined(&room_name, tx.clone(), &webrtc, participant)
-                        {
+                        match rm.on_participant_joined(&room_name, participant) {
                             Ok(_) => {
                                 info!("processed participant joined for: {room_name} room");
                             }
@@ -229,25 +236,35 @@ impl App {
         }
     }
 
+    #[allow(unused)]
+    fn handle_message(
+        room_manager: Rooms,
+        tx: Sender<Stanza>,
+    ) -> impl FnMut(&Context, &mut Connection, &Stanza) -> HandlerResult {
+        move |_ctx, _conn, stanza| {
+            error!("message stanza received: {}", stanza.to_string());
+            HandlerResult::KeepHandler
+        }
+    }
+
     /// Connects to the configured server. `rx` is the queue this client drains
     /// to send stanzas the rooms produce; `tx` is handed to those rooms.
     pub fn connect(
         config: &ConfigSettings,
-        room_manager: RoomManager,
+        room_manager: Rooms,
         tx: Sender<Stanza>,
         rx: Receiver<Stanza>,
     ) -> Result<Self, AppError> {
         let xmpp_client = &config.xmpp_client;
-        let webrtc = config.webrtc.clone();
         let conn = Self::init_xmpp_connection(&xmpp_client.bot_jid, &xmpp_client.bot_password)?;
         let ctx = conn.connect_client(
             Some(&xmpp_client.domain_url),
             Some(xmpp_client.domain_port),
-            Self::xmpp_connection_handler(webrtc, tx.clone(), rx, room_manager),
+            Self::xmpp_connection_handler(tx.clone(), rx, room_manager.clone()),
         );
 
         match ctx {
-            Ok(ctx) => Ok(Self::new(ctx, tx)),
+            Ok(ctx) => Ok(Self::new(ctx, tx, room_manager)),
             Err(err) => Err(AppError::ConnectClientError(err)),
         }
     }
@@ -257,31 +274,33 @@ impl App {
         self.xmpp_context.run();
     }
 
-    /// Queues MUC presence to join `room`, using a random nickname as the
-    /// recorder's endpoint id.
+    /// Creates the room, then queues MUC presence to join it using a random
+    /// nickname as the recorder's endpoint id.
     ///
-    /// Returns as soon as the stanza is queued — the room itself is created
-    /// later, when the server's presence reply comes back.
-    pub fn handle_join_room(tx: &Sender<Stanza>, room: &str) -> Result<String, AppError> {
+    /// The room and its pipeline are built *before* the presence goes out, so
+    /// the presence replies and the Jingle offer that follow have a room to be
+    /// routed to. Returns as soon as the stanza is queued — the join itself
+    /// completes later, on the connection thread.
+    pub fn handle_join_room(
+        room_manager: &Rooms,
+        tx: &Sender<Stanza>,
+        webrtc: &Webrtc,
+        room: &str,
+    ) -> Result<String, AppError> {
         debug!("room: {room}");
 
-        let x = make_stanza!("x", {
-            "xmlns" => "http://jabber.org/protocol/muc"
-        }, [])
-        .map_err(|e| AppError::ParseError {
-            room: room.to_string(),
-            source: e,
-        })?;
+        let (stanza, presence) = Presence::handle_join_recorder(room)?;
 
-        let presence = make_stanza!("presence", {
-            "to" => format!("{}@muc.meet.jitsi/{}", room, nanoid!(10))
-        }, [x])
-        .map_err(|e| AppError::ParseError {
-            room: room.to_string(),
-            source: e,
-        })?;
+        room_manager
+            .lock()
+            .expect("room manager mutex poisoned")
+            .handle_join_room(room, tx.clone(), webrtc, presence)
+            .map_err(|source| AppError::RoomCreationError {
+                room: room.to_string(),
+                source,
+            })?;
 
-        tx.send(presence).map_err(|e| AppError::SendError {
+        tx.send(stanza).map_err(|e| AppError::SendError {
             room: room.to_string(),
             source: e,
         })?;

@@ -36,10 +36,15 @@ const AVATAR_COLORS: [&str; 9] = [
     "#00A8B3",
 ];
 
-/// Picks a stable color for a set of initials, so the same person always gets
-/// the same circle across meetings.
-fn avatar_color(initials: &str) -> &'static str {
-    let hash: u32 = initials.chars().map(|c| c as u32).sum();
+/// Picks a color by summing the code points of the display name, modulo the
+/// palette size — the same hash the Jitsi web UI uses.
+///
+/// The web UI's parameter is named `initials`, but callers pass the raw
+/// display name, and that distinction matters: `test1` and `test2` both reduce
+/// to the initial `T`, so keying on initials would put them on the same
+/// circle where the live UI gives them different ones.
+fn avatar_color(display_name: &str) -> &'static str {
+    let hash: u32 = display_name.chars().map(|c| c as u32).sum();
 
     AVATAR_COLORS[(hash as usize) % AVATAR_COLORS.len()]
 }
@@ -55,7 +60,13 @@ fn cleanup_name(nickname: &str) -> String {
         cleaned = re.replace(&cleaned, "").into_owned();
     }
 
-    cleaned
+    cleaned.trim().to_owned()
+}
+
+/// Separators between name parts: whitespace plus the punctuation the web UI
+/// treats as a word break, so `"ada.lovelace"` yields two words.
+fn word_split_regex() -> Regex {
+    Regex::new(r#"[\s._;\-,|/\\"'()#&]+"#).expect("valid regex")
 }
 
 /// First grapheme cluster of a word, uppercased — a cluster rather than a
@@ -69,23 +80,31 @@ fn first_grapheme(word: &str) -> String {
 
 /// Builds the one- or two-letter monogram: first letter of the first word, plus
 /// first letter of the last word when the name has more than one.
+///
+/// Mirrors the web UI's `getInitials`: the domain of an email address is
+/// dropped, bracketed annotations are stripped, and a name that is *only* an
+/// annotation falls back to the original rather than yielding nothing.
 fn initials(name: &str) -> String {
-    let words = match Regex::new(r"\s*[(\[{][^)\]}]*[)\]}]$") {
-        Ok(re) => re
-            .split(name)
-            .filter(|w| !w.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>(),
+    // Don't use the domain part of an email address, if it is one.
+    let basis = name.split('@').next().unwrap_or(name);
 
-        Err(_) => vec![name.chars().next().unwrap_or_default().to_string()],
+    let cleaned = cleanup_name(basis);
+    let for_initials = if cleaned.trim().is_empty() {
+        basis
+    } else {
+        &cleaned
     };
 
-    let first = words.first().map(|s| first_grapheme(s)).unwrap_or_default();
+    let words: Vec<&str> = word_split_regex()
+        .split(for_initials)
+        .filter(|w| !w.is_empty())
+        .collect();
 
-    let last = if words.len() > 1 {
-        first_grapheme(words.last().unwrap())
-    } else {
-        String::new()
+    let first = words.first().map(|w| first_grapheme(w)).unwrap_or_default();
+
+    let last = match words.len() {
+        0 | 1 => String::new(),
+        n => first_grapheme(words[n - 1]),
     };
 
     format!("{first}{last}")
@@ -121,10 +140,15 @@ pub fn generate_avatar(nickname: &str, path: &str) -> Result<(), AvataError> {
     cr.paint()?;
 
     // Avatar info
-    let name = cleanup_name(nickname);
-    let initials = initials(&name);
+    let cleaned = cleanup_name(nickname);
+    let name = if cleaned.trim().is_empty() {
+        nickname
+    } else {
+        &cleaned
+    };
+    let initials = initials(nickname);
 
-    let color = avatar_color(&initials);
+    let color = avatar_color(nickname);
     let (r, g, b) = hex_to_rgb(color);
 
     // Circle
